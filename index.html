@@ -194,6 +194,17 @@ const FIREBASE_CONFIG = {
 };
 firebase.initializeApp(FIREBASE_CONFIG);
 const db = firebase.firestore();
+// Streaming connections (WebChannel) can silently stall on tablets, Wi-Fi proxies and ad-blockers, so that
+// updates only arrive when something else nudges the connection. Long-polling is slightly less "instant"
+// but far more reliable, so force it.
+db.settings({experimentalForceLongPolling: true, useFetchStreams: false});
+
+// Tracks our own in-flight writes so the safety-net refresh below never shows a stale picture.
+let pendingWrites = 0, writeVersion = 0;
+function trackWrite(promise){
+  pendingWrites++; writeVersion++;
+  return promise.then(r => { pendingWrites--; writeVersion++; return r; }, e => { pendingWrites--; writeVersion++; throw e; });
+}
 
 const MESSAGE_ROOM_KEY = "__MESSAGE__";
 const MAX_VOLUME = 10;
@@ -632,7 +643,7 @@ function sendCustomRequest(){
 function createTask(room, personnel, status, timestamp){
   const id = generateTaskId();
   knownTaskIds.add(id);
-  db.collection('tasks').doc(id).set({room:room, personnel:personnel, status:status, timestamp:timestamp || new Date().toISOString(), createdAt:firebase.firestore.FieldValue.serverTimestamp()})
+  trackWrite(db.collection('tasks').doc(id).set({room:room, personnel:personnel, status:status, timestamp:timestamp || new Date().toISOString(), createdAt:firebase.firestore.FieldValue.serverTimestamp()}))
     .catch(err => { console.error(err); alert("That request could not be sent: " + err.message); });
 }
 function openMessageModal(){ $('message-input-textarea').value=''; openModal('message-modal'); }
@@ -644,15 +655,15 @@ function submitMessage(){
 }
 function confirmClearTasks(){
   if (!confirm('Mark ALL active requests as complete?')) return;
-  db.collection('tasks').get().then(snap => {
+  trackWrite(db.collection('tasks').get({source:'server'}).then(snap => {
     const docs = snap.docs, jobs = [];
     for (let i=0;i<docs.length;i+=400) { const b = db.batch(); docs.slice(i,i+400).forEach(d => b.delete(d.ref)); jobs.push(b.commit()); }
     return Promise.all(jobs);
-  }).catch(err => alert("Failed to complete all: " + err.message));
+  })).catch(err => alert("Failed to complete all: " + err.message));
 }
 function handleCardComplete(id){
   playCompletionTone();
-  db.collection('tasks').doc(id).delete().catch(err => alert("Could not mark that complete: " + err.message));
+  trackWrite(db.collection('tasks').doc(id).delete()).catch(err => alert("Could not mark that complete: " + err.message));
 }
 
 // ---------- live task list ----------
@@ -725,6 +736,26 @@ stagingCategories = clone(categories); stagingButtonStyles = clone(buttonStyles)
 applyGeneralSettings(); updateThemeButtonText(); updateMuteButtonText(); renderControlPanel();
 db.collection('tasks').onSnapshot(handleTasksSnapshot, handleListenerError);
 db.collection('settings').doc('shared').onSnapshot(handleSettingsSnapshot, handleListenerError);
+
+// Safety net: even if the live listener stalls, ask the server directly every few seconds, and
+// immediately when the screen wakes up or the internet comes back. The result is thrown away if one of
+// our own writes happened meanwhile, so a just-submitted card never flickers away.
+let pollBusy = false, pollCount = 0;
+function refreshFromServer(){
+  if (pollBusy || pendingWrites > 0) return;
+  pollBusy = true;
+  const v = writeVersion;
+  const doSettings = (++pollCount % 3 === 0);
+  const jobs = [db.collection('tasks').get({source:'server'}).then(snap => {
+    if (v === writeVersion && pendingWrites === 0) handleTasksSnapshot(snap);
+  })];
+  if (doSettings) jobs.push(db.collection('settings').doc('shared').get({source:'server'}).then(handleSettingsSnapshot));
+  Promise.all(jobs).catch(e => console.warn('Refresh failed:', e)).then(() => { pollBusy = false; });
+}
+setInterval(refreshFromServer, 4000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshFromServer(); });
+window.addEventListener('online', refreshFromServer);
+window.addEventListener('focus', refreshFromServer);
 </script>
 </body>
 </html>
