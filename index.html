@@ -220,7 +220,7 @@
         <button class="settings-menu-item" id="menu-edit-mode-btn" onclick="closeMainSettingsModal(); startEditMode();">Enter Edit Mode</button>
         <button class="settings-menu-item" onclick="closeMainSettingsModal(); openSoundModal();">Sound Settings</button>
         <button class="settings-menu-item" onclick="closeMainSettingsModal(); openGeneralSettingsModal();">Appearance &amp; Layout (Theme, Font, Colors)</button>
-        <button class="settings-menu-item" onclick="closeMainSettingsModal(); openChangePasswordModal();">Change Password</button>
+        <button class="settings-menu-item" id="menu-change-password-btn" onclick="closeMainSettingsModal(); openChangePasswordModal();">Change Password</button>
         <button class="settings-menu-item" onclick="closeMainSettingsModal(); openImportSettingsModal();">Import Settings (from old version)</button>
         <button class="settings-menu-item danger" onclick="resetAllSettings()">
           <div>Reset All Settings</div>
@@ -563,6 +563,16 @@
     // firestore.rules. The "passcode" staff type in is this account's password.
     const OFFICE_EMAIL = "office@pegel-intercom.com";
 
+    // Staff type a short passcode (like 000). Firebase requires passwords of at least 6 characters, so
+    // this fixed text is added behind the scenes. The password you create in the Firebase console must be
+    // the passcode followed by this text (for example: 000pegel-intercom).
+    const PASSCODE_PAD = "pegel-intercom";
+
+    // true  = staff must enter the passcode (the database also requires the login).
+    // false = NO LOGIN: anyone who has the web address can use the intercom. Use this together with
+    //         firestore-open.rules (see "No-login mode" in the setup guide).
+    const REQUIRE_LOGIN = false;
+
     const FIREBASE_READY = !/PASTE/.test(FIREBASE_CONFIG.apiKey);
     let auth = null, db = null;
     if (FIREBASE_READY) {
@@ -769,9 +779,15 @@
         if (e.key === 'Enter') checkPasscode();
       });
       window.addEventListener('offline', function () { setConnectionLost(true); });
+      if (!REQUIRE_LOGIN) document.getElementById('menu-change-password-btn').style.display = 'none';
 
       if (!FIREBASE_READY) {
         showPasscodeOverlay('Setup incomplete: paste your Firebase settings at the top of index.html (see the setup guide).');
+        return;
+      }
+      if (!REQUIRE_LOGIN) { // no-login mode: go straight to the live data
+        hidePasscodeOverlay();
+        startListeners();
         return;
       }
       auth.onAuthStateChanged(function (user) {
@@ -797,7 +813,7 @@
       if (!val) return;
       errEl.style.display = 'none';
 
-      auth.signInWithEmailAndPassword(OFFICE_EMAIL, val)
+      auth.signInWithEmailAndPassword(OFFICE_EMAIL, val + PASSCODE_PAD)
         .then(function () {
           input.value = ''; // the sign-in listener closes the overlay and starts the live data
         })
@@ -844,15 +860,14 @@
 
       if (!cur) { errEl.textContent = "Enter your current password."; errEl.style.display = 'block'; return; }
       if (!n1) { errEl.textContent = "Enter a new password."; errEl.style.display = 'block'; return; }
-      if (n1.length < 6) { errEl.textContent = "The new password must be at least 6 characters."; errEl.style.display = 'block'; return; }
       if (n1 !== n2) { errEl.textContent = "New passwords do not match."; errEl.style.display = 'block'; return; }
 
       const user = auth && auth.currentUser;
       if (!user) { errEl.textContent = "Not signed in."; errEl.style.display = 'block'; return; }
 
-      const cred = firebase.auth.EmailAuthProvider.credential(OFFICE_EMAIL, cur);
+      const cred = firebase.auth.EmailAuthProvider.credential(OFFICE_EMAIL, cur + PASSCODE_PAD);
       user.reauthenticateWithCredential(cred)
-        .then(function () { return user.updatePassword(n1); })
+        .then(function () { return user.updatePassword(n1 + PASSCODE_PAD); })
         .then(function () {
           closeChangePasswordModal();
           alert("Password changed. Other devices will be asked to enter the new password the next time they refresh their sign-in (within about an hour) or when they are reopened.");
@@ -1827,7 +1842,7 @@
     // Pushes this device's current shared-eligible settings up to the spreadsheet. Last save wins.
     // Pushes this device's current shared-eligible settings to everyone. Last save wins.
     function syncSharedSettings() {
-      if (!db || !auth || !auth.currentUser) return;
+      if (!db || (REQUIRE_LOGIN && !(auth && auth.currentUser))) return;
       const json = JSON.stringify(buildSharedPayload());
       lastAppliedSettingsJson = json;
       db.collection('settings').doc('shared').set({
@@ -1900,8 +1915,2152 @@
     function handleListenerError(err) {
       console.error("Live connection error:", err);
       if (err && (err.code === 'permission-denied' || err.code === 'unauthenticated')) {
-        // The sign-in expired or the password was changed elsewhere: ask for the passcode again.
-        if (auth) auth.signOut().catch(function () {});
+        if (REQUIRE_LOGIN) {
+          // The sign-in expired or the password was changed elsewhere: ask for the passcode again.
+          if (auth) auth.signOut().catch(function () {});
+        } else {
+          const b = document.getElementById('connection-banner');
+          b.textContent = 'The database refused access. Check that the rules were published (setup guide, step 5).';
+          b.style.display = 'block';
+        }
+      }
+    }
+
+    function handleTasksSnapshot(snap) {
+      const fromCache = snap.metadata.fromCache;
+      setConnectionLost(fromCache);
+
+      let newlyActive = [];
+      let newlyActiveMessages = [];
+      snap.docChanges().forEach(function (ch) {
+        if (ch.type !== 'added') return;
+        const id = ch.doc.id;
+        if (knownTaskIds.has(id)) return; // includes tasks this device just created (it already chimed)
+        knownTaskIds.add(id);
+        if (firstLoad) return; // tasks that were already open when this device connected stay silent
+        const d = ch.doc.data();
+        if (d.room === MESSAGE_ROOM_KEY) {
+          newlyActiveMessages.push(d);
+        } else {
+          newlyActive.push({ room: d.room || '', personnel: d.personnel || '', status: d.status || '', timestamp: d.timestamp || '' });
+        }
+      });
+
+      if (newlyActiveMessages.length > 0) {
+        unlockAudio();
+        newlyActiveMessages.forEach(function () {
+          playChosenSound(generalSettings.messageSound || 'ALARM_1');
+        });
+      }
+      if (newlyActive.length > 0) {
+        unlockAudio();
+        // Tasks created together (identical timestamp = same submission) are evaluated as one batch,
+        // so a multi-room submission plays one chime, not one per room.
+        let groups = {};
+        newlyActive.forEach(entry => {
+          let key = entry.timestamp || '';
+          if (!groups[key]) groups[key] = [];
+          groups[key].push(entry);
+        });
+        Object.keys(groups).forEach(ts => {
+          evaluateAndPlaySoundBatch(groups[ts]);
+        });
+      }
+
+      cachedData = snap.docs.map(function (doc) {
+        const d = doc.data();
+        return [doc.id, d.room || '', d.personnel || '', d.status || '', d.timestamp || ''];
+      });
+      updateUI(cachedData);
+
+      // Only treat the first snapshot as "already open tasks" once it really came from the server.
+      if (!fromCache) firstLoad = false;
+    }
+
+    function handleSettingsSnapshot(doc) {
+      if (!doc.exists) {
+        if (doc.metadata.fromCache) return; // never decide "nothing is set up" from an empty cache
+        seedSharedSettings();
+        return;
+      }
+      const json = doc.data().json;
+      if (typeof json !== 'string' || json === lastAppliedSettingsJson) return;
+      try {
+        const data = JSON.parse(json);
+        lastAppliedSettingsJson = json;
+        applySharedSettings(data);
+      } catch (e) {
+        console.error("Could not read shared settings:", e);
+      }
+    }
+
+    // First device ever to connect writes its current settings as the shared ones. A transaction makes
+    // sure it can never overwrite settings that already exist.
+    function seedSharedSettings() {
+      if (seedingSharedSettings) return;
+      seedingSharedSettings = true;
+      const ref = db.collection('settings').doc('shared');
+      const json = JSON.stringify(buildSharedPayload());
+      db.runTransaction(function (tx) {
+        return tx.get(ref).then(function (snap) {
+          if (!snap.exists) {
+            tx.set(ref, { json: json, updatedAt: firebase.firestore.FieldValue.serverTimestamp() });
+          }
+        });
+      }).catch(function (err) {
+        console.error("Could not set up shared settings:", err);
+      }).then(function () {
+        seedingSharedSettings = false;
+      });
+    }
+
+    function computeElapsedText(timeStr) {
+      if (!timeStr) return "00:00";
+      const start = new Date(timeStr).getTime();
+      if (isNaN(start)) return "00:00";
+      const diffSecs = Math.max(0, Math.floor((Date.now() - start) / 1000));
+      const mins = Math.floor(diffSecs / 60);
+      const secs = diffSecs % 60;
+      return (mins < 10 ? "0" : "") + mins + ":" + (secs < 10 ? "0" : "") + secs;
+    }
+
+    let lastRenderedSignature = null;
+
+    function updateUI(data) {
+      if (!data || !Array.isArray(data)) return;
+
+      let sorted = [...data].sort((a, b) => {
+        let aIsMsg = a[1] === MESSAGE_ROOM_KEY, bIsMsg = b[1] === MESSAGE_ROOM_KEY;
+        if (aIsMsg !== bIsMsg) return aIsMsg ? -1 : 1;
+        let tA = a[4] ? new Date(a[4]).getTime() : 0;
+        let tB = b[4] ? new Date(b[4]).getTime() : 0;
+        return tA - tB;
+      });
+
+      let activeSection = document.getElementById("active-section");
+
+      let signature = JSON.stringify(sorted);
+      if (signature === lastRenderedSignature) {
+        activeSection.style.display = sorted.length > 0 ? "block" : "none";
+        return;
+      }
+      lastRenderedSignature = signature;
+
+      let activeGrid = document.getElementById("active-grid");
+      activeGrid.innerHTML = "";
+
+      sorted.forEach(row => {
+        let taskId = row[0], room = row[1], personnel = row[2], status = row[3], timestamp = row[4];
+        let isMessage = room === MESSAGE_ROOM_KEY;
+        let cardColor = getCardColor(personnel, status, room);
+
+        let cardDiv = document.createElement("div");
+        cardDiv.className = "card";
+        cardDiv.style.borderLeftColor = cardColor;
+
+        let detailsHtml = isMessage
+          ? `<div class="card-details">${personnel}</div>`
+          : `<div class="card-room">${room}</div><div class="card-details">${buildDetailsText(personnel, status)}</div>`;
+
+        let timerHtml = isMessage
+          ? ``
+          : `<div class="timer-display" data-time="${timestamp}">${computeElapsedText(timestamp)}</div>`;
+
+        cardDiv.innerHTML = `
+          <div class="card-info">
+            ${detailsHtml}
+            ${timerHtml}
+          </div>
+          <button class="btn-clear" onclick="handleCardComplete('${taskId}')">Mark Complete</button>
+        `;
+        activeGrid.appendChild(cardDiv);
+      });
+
+      activeSection.style.display = sorted.length > 0 ? "block" : "none";
+    }
+
+    function openMessageModal() {
+      document.getElementById('message-input-textarea').value = '';
+      document.getElementById('message-modal').style.display = 'flex';
+    }
+
+    function closeMessageModal() {
+      document.getElementById('message-modal').style.display = 'none';
+    }
+
+    function submitMessage() {
+      let text = document.getElementById('message-input-textarea').value.trim();
+      if (!text) { alert("Please enter a message."); return; }
+
+      let timestamp = new Date().toISOString();
+      unlockAudio();
+      playChosenSound(generalSettings.messageSound || 'ALARM_1');
+
+      createTaskLocal(MESSAGE_ROOM_KEY, text, "Message", timestamp);
+      closeMessageModal();
+    }
+
+    // Creates a new active task. The card appears on this device immediately (Firestore shows local
+    // writes right away) and on every other device as soon as the server confirms it.
+    function createTaskLocal(room, personnel, status, timestamp) {
+      let taskId = generateTaskId();
+      timestamp = timestamp || new Date().toISOString();
+      knownTaskIds.add(taskId); // this device already chimed for it; don't chime again when it echoes back
+
+      db.collection('tasks').doc(taskId).set({
+        room: room,
+        personnel: personnel,
+        status: status,
+        timestamp: timestamp,
+        createdAt: firebase.firestore.FieldValue.serverTimestamp()
+      }).catch(function (err) {
+        console.error("Create task failed:", err);
+        alert("That request could not be sent: " + err.message);
+      });
+    }
+
+    function handleCardComplete(taskId) {
+      playCompletionTone();
+      db.collection('tasks').doc(taskId).delete().catch(function (err) {
+        console.error("Complete task failed:", err);
+        alert("Could not mark that complete: " + err.message);
+      });
+    }
+
+    // Visible countdown text: updates once a second.
+    setInterval(function () {
+      document.querySelectorAll('.timer-display').forEach(el => {
+        el.textContent = computeElapsedText(el.getAttribute('data-time'));
+      });
+    }, 1000);
+
+  </script>
+</body>
+</html><!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>Pegel Family Dental Intercom</title>
+  <link href="https://fonts.googleapis.com/css2?family=Assistant:wght@400;600;700;800&family=Roboto:wght@400;600;700&family=Open+Sans:wght@400;600;700&family=Inter:wght@400;600;700&family=Montserrat:wght@400;600;700&family=Lato:wght@400;700&family=Nunito:wght@400;600;700&family=Quicksand:wght@400;600;700&family=Outfit:wght@400;600;700&family=Lexend+Deca:wght@400;600;700&family=Roboto+Mono:wght@400;600;700&family=Playfair+Display:wght@400;700;800&family=Roboto+Slab:wght@400;600;700&family=Merriweather:wght@400;700&family=Comic+Relief&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-color: #f4f6f9;
+      --text-color: #333333;
+      --subtitle-color: #555555;
+      --card-bg: #ffffff;
+      --card-border: #9e9e9e;
+      --panel-bg: #ffffff;
+      --panel-border: #dddddd;
+      --btn-bg: #e0e0e0;
+      --btn-text: #333333;
+      --btn-selected-bg: #8eb7f7;
+      --btn-selected-text: #ffffff;
+      --base-font-size: 16px;
+      --send-btn-bg: #4485ca;
+      --send-btn-text: #ffffff;
+      --message-btn-bg: #333333;
+      --message-btn-text: #ffffff;
+      --reset-btn-bg: #dc534c;
+      --reset-btn-text: #ffffff;
+      --settings-btn-bg: #707070;
+      --settings-btn-text: #ffffff;
+      --font-family: 'Assistant', sans-serif;
+    }
+
+    html { font-size: var(--base-font-size); }
+
+    body.dark-mode {
+      --bg-color: #121212;
+      --text-color: #e0e0e0;
+      --subtitle-color: #cccccc;
+      --card-bg: #2a2a2a;
+      --card-border: #555555;
+      --panel-bg: #1e1e1e;
+      --panel-border: #333333;
+      --btn-bg: #333333;
+      --btn-text: #e0e0e0;
+      --btn-selected-bg: #69c2c8;
+      --btn-selected-text: #ffffff;
+      --message-btn-bg: var(--custom-msg-btn-bg, #333333);
+      --message-btn-text: var(--custom-msg-btn-text, #e0e0e0);
+      --reset-btn-bg: var(--custom-reset-btn-bg, #dc534c);
+      --reset-btn-text: var(--custom-reset-btn-text, #ffffff);
+      --settings-btn-bg: var(--custom-settings-btn-bg, #707070);
+      --settings-btn-text: var(--custom-settings-btn-text, #e0e0e0);
+    }
+
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; user-select: none; }
+    body { font-family: var(--font-family); background: var(--bg-color); color: var(--text-color); font-size: 1rem; margin: 0; padding: 15px; text-align: center; transition: background 0.3s, color 0.3s; }
+
+    textarea, input { user-select: text; }
+
+    /* Shown whenever this device can't reach the server, so nobody trusts a screen that has gone stale. */
+    #connection-banner { display: none; position: fixed; top: 0; left: 0; right: 0; background: #dc534c; color: #ffffff; font-weight: 700; font-size: 0.875rem; padding: 8px 12px; z-index: 3000; text-align: center; box-shadow: 0 2px 6px rgba(0,0,0,0.3); }
+
+    .header-container { display: flex; justify-content: space-between; align-items: center; max-width: 1200px; margin: 0 auto; flex-wrap: wrap; gap: 10px; }
+    .logo-title-wrapper { display: flex; align-items: center; gap: 15px; text-align: left; text-decoration: none; color: inherit; cursor: default; }
+
+    .logo-text-group { display: flex; flex-direction: column; justify-content: center; }
+    .logo-main { font-size: 2.15rem; font-weight: 800; letter-spacing: -0.5px; display: flex; align-items: center; line-height: 1.15; color: var(--text-color); }
+
+    .header-controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .header-btn { padding: 8px 16px; font-size: 0.8125rem; font-weight: bold; border-radius: 6px; cursor: pointer; border: none; font-family: var(--font-family); text-decoration: none; display: inline-flex; align-items: center; gap: 6px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); transition: opacity 0.2s; }
+    .header-btn:hover { opacity: 0.9; }
+
+    .btn-message-header { background: var(--message-btn-bg); color: var(--message-btn-text); border: 1px solid var(--panel-border); }
+    .btn-complete-all { background: var(--reset-btn-bg); color: var(--reset-btn-text); }
+    .btn-settings-main { background: var(--settings-btn-bg); color: var(--settings-btn-text); }
+    .btn-save-edit { background: #5c9271; color: #ffffff; display: none; }
+    .btn-discard-edit { background: #dc534c; color: #ffffff; display: none; }
+    .btn-settings-editing { background: var(--settings-btn-bg); color: var(--settings-btn-text); padding: 8px 10px; display: none; font-size: 1rem; }
+
+    body.editing-active .btn-message-header { display: none; }
+    body.editing-active .btn-complete-all { display: none; }
+    body.editing-active .btn-settings-main { display: none; }
+    body.editing-active .btn-save-edit { display: inline-flex; }
+    body.editing-active .btn-discard-edit { display: inline-flex; }
+    body.editing-active .btn-settings-editing { display: inline-flex; }
+
+    .section-title { text-align: left; max-width: 1200px; margin: 15px auto 8px auto; font-size: 1.125rem; font-weight: bold; color: var(--text-color); border-bottom: 2px solid var(--panel-border); padding-bottom: 4px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+
+    .category-edit-controls { display: none; gap: 4px; flex-wrap: wrap; }
+    body.editing-active .category-edit-controls { display: flex; }
+    .cat-order-btn { background: var(--btn-bg); color: var(--btn-text); border: 1px solid var(--panel-border); border-radius: 4px; padding: 3px 9px; font-size: 0.75rem; cursor: pointer; white-space: nowrap; font-family: var(--font-family); }
+    .cat-order-btn.danger { background: #dc534c; color: #fff; border-color: #dc534c; }
+
+    .active-stack { display: flex; flex-direction: column; gap: 12px; max-width: 1200px; margin: 0 auto; }
+
+    .card { background: var(--card-bg); padding: 16px 20px; border-radius: 8px; box-shadow: 0 3px 6px rgba(0,0,0,0.15); border-left: 8px solid var(--card-border); text-align: left; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
+    .card-info { display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
+    .card-room { font-size: 1.875rem; font-weight: 800; color: var(--text-color); letter-spacing: 0.5px; }
+    .card-details { font-size: 1.375rem; font-weight: 700; color: var(--subtitle-color); background: rgba(0,0,0,0.06); padding: 6px 12px; border-radius: 6px; }
+    .timer-display { font-size: 1.125rem; font-family: monospace; background: rgba(0,0,0,0.1); padding: 6px 10px; border-radius: 6px; font-weight: bold; }
+
+    .control-panel { max-width: 1200px; margin: 15px auto 0 auto; background: var(--panel-bg); border: 1px solid var(--panel-border); border-radius: 8px; padding: 16px; text-align: left; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+    .builder-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; align-items: center; }
+
+    .builder-btn-wrapper { position: relative; display: inline-flex; flex-direction: column; min-width: 90px; flex: 1; }
+    .builder-btn { padding: 10px 14px; font-size: 0.875rem; font-weight: bold; border-radius: 6px; cursor: pointer; border: 1px solid var(--panel-border); background: var(--btn-bg); color: var(--btn-text); font-family: var(--font-family); width: 100%; text-align: center; transition: background 0.2s, color 0.2s, box-shadow 0.2s; }
+
+    .builder-btn.selected {
+      filter: brightness(0.82);
+      border: 2px solid rgba(255,255,255,0.85) !important;
+      box-shadow: 0 0 0 3px rgba(0,0,0,0.3), 0 4px 8px rgba(0,0,0,0.3);
+      transform: translateY(-1px);
+    }
+
+    .item-edit-bar { display: none; justify-content: space-between; align-items: center; background: rgba(0,0,0,0.08); padding: 2px 6px; border-radius: 0 0 6px 6px; font-size: 0.6875rem; margin-top: -2px; }
+    body.editing-active .item-edit-bar { display: flex; }
+    .item-edit-btn { background: transparent; border: none; cursor: pointer; font-size: 0.75rem; padding: 2px 5px; color: var(--text-color); font-weight: bold; }
+    .item-edit-btn:hover { opacity: 0.7; }
+
+    .add-btn-wrapper { display: none; }
+    body.editing-active .add-btn-wrapper { display: inline-flex; }
+
+    .add-item-btn { padding: 6px 10px; font-size: 0.75rem; font-weight: bold; border-radius: 4px; border: 2px dashed var(--subtitle-color); background: transparent; color: var(--subtitle-color); cursor: pointer; white-space: nowrap; font-family: var(--font-family); }
+    .add-item-btn:hover { background: rgba(0,0,0,0.05); }
+
+    .add-section-row { display: none; justify-content: center; margin-top: 10px; }
+    body.editing-active .add-section-row { display: flex; }
+
+    .panel-actions-container { display: flex; flex-direction: column; align-items: center; margin-top: 15px; border-top: 1px solid var(--panel-border); padding-top: 15px; gap: 8px; }
+    .panel-footer-note { font-size: 0.75rem; color: var(--subtitle-color); font-style: italic; text-align: center; }
+    .btn-send-dispatch { background: var(--send-btn-bg); color: var(--send-btn-text); border: none; padding: 12px 32px; font-size: 1rem; font-weight: 800; border-radius: 6px; cursor: pointer; font-family: var(--font-family); box-shadow: 0 2px 5px rgba(0,0,0,0.15); transition: opacity 0.2s; }
+    .btn-send-dispatch:active { opacity: 0.8; }
+
+    .btn-clear { background: #dc534c; color: white; border: none; padding: 10px 20px; font-size: 0.9375rem; font-weight: bold; border-radius: 6px; cursor: pointer; font-family: var(--font-family); }
+
+    .modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); backdrop-filter: blur(3px); display: none; justify-content: center; align-items: center; z-index: 1000; animation: fadeIn 0.2s ease; }
+    .modal-content { background: var(--panel-bg); border: 1px solid var(--panel-border); padding: 24px; border-radius: 12px; max-width: 480px; width: 90%; text-align: left; max-height: 90vh; overflow-y: auto; box-shadow: 0 10px 25px rgba(0,0,0,0.3); }
+    .modal-title { font-size: 1.25rem; font-weight: 800; margin-top: 0; margin-bottom: 16px; color: var(--text-color); display: flex; align-items: center; justify-content: space-between; }
+    .modal-group { margin-bottom: 14px; }
+    .modal-label { font-size: 0.8125rem; font-weight: 700; color: var(--subtitle-color); margin-bottom: 6px; display: block; }
+    .modal-input { width: 100%; padding: 10px 12px; border-radius: 6px; border: 1px solid var(--panel-border); background: var(--bg-color); color: var(--text-color); font-family: var(--font-family); font-size: 0.875rem; }
+
+    .color-input-row { display: flex; gap: 8px; align-items: center; }
+    .color-picker-input { width: 45px; height: 38px; border: none; border-radius: 6px; cursor: pointer; background: none; }
+    .hex-text-input { flex: 1; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--panel-border); background: var(--bg-color); color: var(--text-color); font-family: monospace; font-size: 0.8125rem; }
+    .default-reset-row { display: flex; gap: 6px; margin-top: 4px; flex-wrap: wrap; }
+    .small-action-btn { flex: 1; font-size: 0.6875rem; padding: 4px; background: var(--btn-bg); color: var(--btn-text); border: 1px solid var(--panel-border); border-radius: 4px; cursor: pointer; font-family: var(--font-family); min-width: 100px; }
+
+    .preview-box-container { background: var(--bg-color); border: 1px dashed var(--panel-border); padding: 12px; border-radius: 8px; margin-bottom: 16px; text-align: center; }
+    .preview-box-label { font-size: 0.6875rem; text-transform: uppercase; font-weight: bold; color: var(--subtitle-color); margin-bottom: 6px; }
+    .preview-elements-wrap { display: flex; gap: 10px; justify-content: center; align-items: center; flex-wrap: wrap; }
+    .preview-sample-btn { padding: 8px 14px; border-radius: 6px; font-weight: bold; font-size: 0.8125rem; border: 1px solid transparent; }
+    .preview-sample-card { border-left: 6px solid #69c2c8; background: var(--card-bg); padding: 8px 12px; border-radius: 6px; font-size: 0.8125rem; font-weight: bold; text-align: left; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+
+    .modal-actions { display: flex; gap: 10px; margin-top: 20px; }
+    .modal-btn { flex: 1; padding: 10px; border-radius: 6px; font-weight: bold; border: none; cursor: pointer; font-family: var(--font-family); font-size: 0.875rem; }
+    .modal-btn-primary { background: #4485ca; color: white; }
+    .modal-btn-danger { background: #dc534c; color: white; }
+    .modal-btn-secondary { background: var(--btn-bg); color: var(--btn-text); border: 1px solid var(--panel-border); }
+    .checklist-group { margin-bottom: 12px; }
+    .checklist-label { display: flex; align-items: center; gap: 8px; font-size: 0.875rem; margin-bottom: 6px; cursor: pointer; }
+
+    .settings-menu-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 6px; }
+    .settings-menu-item { width: 100%; text-align: left; padding: 12px 14px; border-radius: 8px; border: 1px solid var(--panel-border); background: var(--btn-bg); color: var(--btn-text); font-family: var(--font-family); font-size: 0.9375rem; font-weight: 700; cursor: pointer; transition: opacity 0.2s; }
+    .settings-menu-item:hover { opacity: 0.85; }
+    .settings-menu-item.danger { background: #dc534c; color: #fff; border-color: #dc534c; }
+    .settings-menu-item.muted-active { background: #dc534c; color: #fff; border-color: #dc534c; }
+    .modal-close-x { background: transparent; border: none; font-size: 1.1rem; cursor: pointer; color: var(--subtitle-color); padding: 0 4px; }
+
+    .passcode-input-box { width: 100%; padding: 12px; text-align: center; letter-spacing: 6px; font-size: 1.5rem; border-radius: 6px; border: 1px solid var(--panel-border); background: var(--bg-color); color: var(--text-color); font-family: var(--font-family); }
+    .passcode-error-text { color: #dc534c; font-size: 0.8125rem; margin-top: 8px; display: none; text-align: center; }
+
+    @keyframes fadeIn { from { opacity: 0; transform: scale(0.95); } to { opacity: 1; transform: scale(1); } }
+  </style>
+</head>
+<body>
+
+  <div id="connection-banner">No connection to the server. New requests may not appear until it reconnects.</div>
+
+  <div class="header-container">
+    <div class="logo-title-wrapper">
+      <div class="logo-text-group">
+        <div class="logo-main" id="app-title-display">Pegel Family Dental</div>
+      </div>
+    </div>
+    <div class="header-controls">
+      <button class="header-btn btn-message-header" onclick="openMessageModal()">Message</button>
+      <button class="header-btn btn-complete-all" onclick="confirmClearTasks()">Complete All</button>
+      <button class="header-btn btn-settings-main" onclick="openMainSettingsModal()">&#9881; Settings</button>
+      <button class="header-btn btn-save-edit" onclick="saveEditMode()">Save &amp; Exit</button>
+      <button class="header-btn btn-discard-edit" onclick="discardEditMode()">Discard Changes</button>
+      <button class="header-btn btn-settings-editing" onclick="openMainSettingsModal()" title="Settings">&#9881;</button>
+    </div>
+  </div>
+
+  <div id="active-section" style="display:none;">
+    <div class="section-title">Active Requests</div>
+    <div class="active-stack" id="active-grid"></div>
+  </div>
+
+  <div class="control-panel">
+    <div id="categories-container"></div>
+    <div class="add-section-row">
+      <button class="add-item-btn" onclick="addCategory()">+ Add New Section</button>
+    </div>
+
+    <div class="panel-actions-container">
+      <div style="display:flex; gap:10px; flex-wrap:wrap; justify-content:center;">
+        <button class="btn-send-dispatch" onclick="sendCustomRequest()">Submit</button>
+      </div>
+      <div class="panel-footer-note">Select any combination of options and hit submit.</div>
+    </div>
+  </div>
+
+  <!-- Main Settings Hub Modal -->
+  <div class="modal-overlay" id="main-settings-modal">
+    <div class="modal-content">
+      <div class="modal-title">Settings <button class="modal-close-x" onclick="closeMainSettingsModal()">&#10005;</button></div>
+      <div class="settings-menu-list">
+        <button class="settings-menu-item" id="menu-edit-mode-btn" onclick="closeMainSettingsModal(); startEditMode();">Enter Edit Mode</button>
+        <button class="settings-menu-item" onclick="closeMainSettingsModal(); openSoundModal();">Sound Settings</button>
+        <button class="settings-menu-item" onclick="closeMainSettingsModal(); openGeneralSettingsModal();">Appearance &amp; Layout (Theme, Font, Colors)</button>
+        <button class="settings-menu-item" id="menu-change-password-btn" onclick="closeMainSettingsModal(); openChangePasswordModal();">Change Password</button>
+        <button class="settings-menu-item" onclick="closeMainSettingsModal(); openImportSettingsModal();">Import Settings (from old version)</button>
+        <button class="settings-menu-item danger" onclick="resetAllSettings()">
+          <div>Reset All Settings</div>
+          <div style="font-size: 0.75rem; font-weight: normal; opacity: 0.9; margin-top: 2px;">Restores default sections, buttons, layouts, and custom themes</div>
+        </button>
+      </div>
+      <div class="modal-actions">
+        <button class="modal-btn modal-btn-secondary" onclick="closeMainSettingsModal()">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Button Configuration Modal -->
+  <div class="modal-overlay" id="button-edit-modal">
+    <div class="modal-content">
+      <div class="modal-title">Edit Button <span id="modal-edit-item-name" style="font-size: 0.875rem; color:var(--subtitle-color);"></span></div>
+
+      <div class="preview-box-container">
+        <div class="preview-box-label">Live Preview</div>
+        <div class="preview-elements-wrap">
+          <button class="preview-sample-btn" id="preview-btn-element">Sample Name</button>
+          <div class="preview-sample-card" id="preview-card-element">Room 1 &bull; Sample Name</div>
+        </div>
+      </div>
+
+      <div class="modal-group">
+        <label class="modal-label">Button Name:</label>
+        <input type="text" id="modal-input-name" class="modal-input" oninput="updateModalPreview()">
+      </div>
+
+      <div class="modal-group">
+        <label class="modal-label">Button Background Color:</label>
+        <div class="color-input-row">
+          <input type="color" id="modal-input-btn-color" class="color-picker-input" oninput="syncColorInput('btn'); updateModalPreview();">
+          <input type="text" id="modal-hex-btn-color" class="hex-text-input" oninput="syncColorPicker('btn'); updateModalPreview();" placeholder="Leave empty for default">
+        </div>
+        <div class="default-reset-row">
+          <button class="small-action-btn" onclick="clearButtonCustomColor()">Use Dynamic Theme Default</button>
+        </div>
+      </div>
+
+      <div class="modal-group">
+        <label class="modal-label">Active Card Border / Accent Color:</label>
+        <div class="color-input-row">
+          <input type="color" id="modal-input-card-color" class="color-picker-input" oninput="syncColorInput('card'); updateModalPreview();">
+          <input type="text" id="modal-hex-card-color" class="hex-text-input" oninput="syncColorPicker('card'); updateModalPreview();" placeholder="#69c2c8">
+        </div>
+        <div class="default-reset-row">
+          <button class="small-action-btn" onclick="resetColorToDefault('card', 'light')">Reset Light Default</button>
+          <button class="small-action-btn" onclick="resetColorToDefault('card', 'dark')">Reset Dark Default</button>
+        </div>
+      </div>
+
+      <div style="margin-bottom: 14px;">
+        <button class="modal-btn modal-btn-secondary" style="width: 100%; font-size: 0.8125rem; padding: 6px;" onclick="matchButtonAndCardColors()">Match Button &amp; Card Colors</button>
+      </div>
+
+      <div class="modal-group">
+        <label class="modal-label">Associated Chime Sound (Select to preview):</label>
+        <select id="modal-input-sound" class="modal-input" onchange="previewSelectedSound(this.value)">
+          <option value="GAF">GAF</option>
+          <option value="GBG">GBG</option>
+          <option value="CAF">CAF</option>
+          <option value="CEE">CEE</option>
+          <option value="GGG">GGG</option>
+          <option value="AF">AF</option>
+          <option value="FF">FF</option>
+          <option value="EEC">EEC</option>
+          <option value="DD">DD</option>
+          <option value="GC">GC</option>
+          <option value="CG">CG</option>
+          <option value="G">G</option>
+          <option value="D">D</option>
+          <option value="ALARM_1">ALARM 1</option>
+          <option value="ALARM_2">ALARM 2 (held alert)</option>
+          <option value="none">Muted / No Chime</option>
+        </select>
+      </div>
+
+      <div class="modal-actions">
+        <button class="modal-btn modal-btn-primary" onclick="saveButtonModal()">Save Changes</button>
+        <button class="modal-btn modal-btn-danger" onclick="deleteItemFromModal()">Delete Button</button>
+        <button class="modal-btn modal-btn-secondary" onclick="closeButtonModal()">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- General Settings Modal (Appearance, Theme, Font, Layout) -->
+  <div class="modal-overlay" id="general-settings-modal">
+    <div class="modal-content">
+      <div class="modal-title">Appearance &amp; Layout Settings</div>
+
+      <div class="modal-group">
+        <label class="modal-label">Theme:</label>
+        <button class="modal-btn modal-btn-secondary" style="width:100%;" id="modal-theme-toggle-btn" onclick="toggleTheme()">Switch Theme</button>
+      </div>
+
+      <div class="modal-group">
+        <label class="modal-label">Font:</label>
+        <select id="modal-general-font" class="modal-input">
+          <option value="Assistant">Assistant (Default)</option>
+          <option value="Roboto">Roboto</option>
+          <option value="Open Sans">Open Sans</option>
+          <option value="Inter">Inter</option>
+          <option value="Montserrat">Montserrat</option>
+          <option value="Lato">Lato</option>
+          <option value="Nunito">Nunito</option>
+          <option value="Quicksand">Quicksand</option>
+          <option value="Outfit">Outfit</option>
+          <option value="Lexend Deca">Lexend Deca</option>
+          <option value="Roboto Mono">Roboto Mono</option>
+          <option value="Playfair Display">Playfair Display (Bold)</option>
+          <option value="Roboto Slab">Roboto Slab (Bold)</option>
+          <option value="Merriweather">Merriweather</option>
+          <option value="Comic Relief">Comic Relief</option>
+        </select>
+      </div>
+
+      <div class="modal-group">
+        <label class="modal-label">Title Text:</label>
+        <input type="text" id="modal-general-title" class="modal-input" placeholder="Pegel Family Dental">
+      </div>
+
+      <div class="modal-group">
+        <label class="modal-label">Message Card Color:</label>
+        <div class="color-input-row">
+          <input type="color" id="modal-message-color-picker" class="color-picker-input" oninput="document.getElementById('modal-message-color-hex').value = this.value;">
+          <input type="text" id="modal-message-color-hex" class="hex-text-input" placeholder="#cab0ed">
+        </div>
+      </div>
+
+      <div class="modal-group">
+        <label class="modal-label">Custom Background Color (applies in both light &amp; dark mode):</label>
+        <div class="color-input-row">
+          <input type="color" id="modal-general-bg-picker" class="color-picker-input" oninput="document.getElementById('modal-general-bg-hex').value = this.value;">
+          <input type="text" id="modal-general-bg-hex" class="hex-text-input" placeholder="#f4f6f9">
+        </div>
+        <div class="default-reset-row">
+          <button class="small-action-btn" onclick="useAutomaticBackground()">Use Automatic Theme Background</button>
+        </div>
+      </div>
+
+      <div class="modal-group">
+        <label class="modal-label">Base Font Size: <span id="fontsize-value-display">20px</span></label>
+        <input type="range" id="modal-general-fontsize" class="modal-input" min="14" max="36" step="1" style="padding:0;" oninput="document.getElementById('fontsize-value-display').textContent = this.value + 'px';">
+      </div>
+
+      <div class="modal-group">
+        <label class="modal-label">Send Request Button Background Color:</label>
+        <div class="color-input-row">
+          <input type="color" id="modal-send-bg-picker" class="color-picker-input" oninput="document.getElementById('modal-send-bg-hex').value = this.value;">
+          <input type="text" id="modal-send-bg-hex" class="hex-text-input" placeholder="#4485ca">
+        </div>
+      </div>
+
+      <div class="modal-group">
+        <label class="modal-label">Send Request Button Text Color:</label>
+        <div class="color-input-row">
+          <input type="color" id="modal-send-text-picker" class="color-picker-input" oninput="document.getElementById('modal-send-text-hex').value = this.value;">
+          <input type="text" id="modal-send-text-hex" class="hex-text-input" placeholder="#ffffff">
+        </div>
+      </div>
+
+      <div class="modal-group">
+        <label class="modal-label">Message Button Background Color (Applies to Light &amp; Dark Mode):</label>
+        <div class="color-input-row">
+          <input type="color" id="modal-msg-btn-bg-picker" class="color-picker-input" oninput="document.getElementById('modal-msg-btn-bg-hex').value = this.value;">
+          <input type="text" id="modal-msg-btn-bg-hex" class="hex-text-input" placeholder="#333333">
+        </div>
+      </div>
+
+      <div class="modal-group">
+        <label class="modal-label">Complete All Button Background Color (Applies to Light &amp; Dark Mode):</label>
+        <div class="color-input-row">
+          <input type="color" id="modal-reset-btn-bg-picker" class="color-picker-input" oninput="document.getElementById('modal-reset-btn-bg-hex').value = this.value;">
+          <input type="text" id="modal-reset-btn-bg-hex" class="hex-text-input" placeholder="#dc534c">
+        </div>
+      </div>
+
+      <div class="modal-group">
+        <label class="modal-label">Settings Button Background Color (Applies to Light &amp; Dark Mode):</label>
+        <div class="color-input-row">
+          <input type="color" id="modal-settings-btn-bg-picker" class="color-picker-input" oninput="document.getElementById('modal-settings-btn-bg-hex').value = this.value;">
+          <input type="text" id="modal-settings-btn-bg-hex" class="hex-text-input" placeholder="#707070">
+        </div>
+      </div>
+
+      <div class="modal-actions">
+        <button class="modal-btn modal-btn-primary" onclick="saveGeneralSettings()">Apply Settings</button>
+        <button class="modal-btn modal-btn-secondary" onclick="closeGeneralSettingsModal()">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Sound Settings Modal -->
+  <div class="modal-overlay" id="sound-modal">
+    <div class="modal-content">
+      <div class="modal-title">Sound Settings</div>
+
+      <div class="modal-group">
+        <button class="settings-menu-item" id="menu-mute-btn" onclick="toggleGlobalMute()">Mute All Sounds</button>
+      </div>
+
+      <div class="modal-group">
+        <label class="modal-label">Master Volume: <span id="volume-value-display">1000%</span></label>
+        <input type="range" id="modal-volume-slider" min="0.5" max="10" step="0.1" style="width:100%;" oninput="updateVolumeDisplay(this.value); previewVolumeChange();" onchange="saveVolumeSetting(this.value)">
+        <p style="font-size: 0.75rem; color: var(--subtitle-color); margin: 4px 0 0 0;">Defaults to maximum. If it's still too quiet, your device's own system/media volume is the hard ceiling &mdash; this can't go past that.</p>
+      </div>
+
+      <div class="modal-group">
+        <label class="checklist-label">
+          <input type="checkbox" id="modal-completion-sound-chk" onchange="toggleCompletionSoundSetting()"> Play a sound when marking a card complete
+        </label>
+      </div>
+
+      <div class="modal-group">
+        <label class="modal-label">Message Button Sound:</label>
+        <select id="modal-message-sound" class="modal-input" onchange="previewSelectedSound(this.value); saveMessageSoundSetting();">
+          <option value="GAF">GAF</option>
+          <option value="GBG">GBG</option>
+          <option value="CAF">CAF</option>
+          <option value="CEE">CEE</option>
+          <option value="GGG">GGG</option>
+          <option value="AF">AF</option>
+          <option value="FF">FF</option>
+          <option value="EEC">EEC</option>
+          <option value="DD">DD</option>
+          <option value="GC">GC</option>
+          <option value="CG">CG</option>
+          <option value="G">G</option>
+          <option value="D">D</option>
+          <option value="ALARM_1">ALARM 1</option>
+          <option value="ALARM_2">ALARM 2 (held alert)</option>
+          <option value="none">Muted / No Chime</option>
+        </select>
+      </div>
+
+      <p style="font-size: 0.8125rem; color: var(--subtitle-color); margin-top: 0;">By default every chime below is on. Uncheck any item to silence its alert on this specific device.</p>
+
+      <div id="sound-modal-groups"></div>
+
+      <button class="modal-btn modal-btn-primary" style="width:100%; margin-top:15px;" onclick="closeSoundModal()">Save &amp; Close</button>
+    </div>
+  </div>
+
+  <!-- Message Modal -->
+  <div class="modal-overlay" id="message-modal">
+    <div class="modal-content">
+      <div class="modal-title">Send a Message <button class="modal-close-x" onclick="closeMessageModal()">&#10005;</button></div>
+      <div class="modal-group">
+        <label class="modal-label">Message:</label>
+        <textarea id="message-input-textarea" class="modal-input" rows="4" placeholder="Type a message to pin above all active cards..."></textarea>
+      </div>
+      <div class="modal-actions">
+        <button class="modal-btn modal-btn-primary" onclick="submitMessage()">Submit</button>
+        <button class="modal-btn modal-btn-secondary" onclick="closeMessageModal()">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Change Password Modal -->
+  <div class="modal-overlay" id="change-password-modal">
+    <div class="modal-content">
+      <div class="modal-title">Change Password <button class="modal-close-x" onclick="closeChangePasswordModal()">&#10005;</button></div>
+      <p style="font-size: 0.8125rem; color: var(--subtitle-color); margin-top: 0;">This password is shared by every device running this app. Once changed, all other devices will be asked to enter the new password the next time they open it.</p>
+      <div class="modal-group">
+        <label class="modal-label">Current Password:</label>
+        <input type="password" id="cp-current" class="modal-input" autocomplete="off">
+      </div>
+      <div class="modal-group">
+        <label class="modal-label">New Password:</label>
+        <input type="password" id="cp-new1" class="modal-input" autocomplete="off">
+      </div>
+      <div class="modal-group">
+        <label class="modal-label">Confirm New Password:</label>
+        <input type="password" id="cp-new2" class="modal-input" autocomplete="off">
+      </div>
+      <div id="cp-error" style="color:#dc534c; font-size:0.8125rem; display:none; margin-bottom:8px;"></div>
+      <label class="checklist-label">
+        <input type="checkbox" id="cp-show-chk" onchange="toggleChangePasswordVisibility()"> Show passwords
+      </label>
+      <div class="modal-actions">
+        <button class="modal-btn modal-btn-primary" onclick="submitChangePassword()">Confirm</button>
+        <button class="modal-btn modal-btn-secondary" onclick="closeChangePasswordModal()">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Import Settings Modal (one-time migration from the Google Apps Script version) -->
+  <div class="modal-overlay" id="import-settings-modal">
+    <div class="modal-content">
+      <div class="modal-title">Import Settings <button class="modal-close-x" onclick="closeImportSettingsModal()">&#10005;</button></div>
+      <p style="font-size: 0.8125rem; color: var(--subtitle-color); margin-top: 0;">Paste the settings text exported from the old version (see the setup guide, step 9). This replaces the shared sections, buttons, colors and sounds for every device.</p>
+      <div class="modal-group">
+        <textarea id="import-settings-textarea" class="modal-input" rows="8" placeholder="Paste the exported text here..."></textarea>
+      </div>
+      <div id="import-error" style="color:#dc534c; font-size:0.8125rem; display:none; margin-bottom:8px;"></div>
+      <div class="modal-actions">
+        <button class="modal-btn modal-btn-primary" onclick="submitImportSettings()">Import</button>
+        <button class="modal-btn modal-btn-secondary" onclick="closeImportSettingsModal()">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Passcode Lock Overlay -->
+  <div class="modal-overlay" id="passcode-overlay" style="z-index:2000;">
+    <div class="modal-content" style="max-width:340px;">
+      <div class="modal-title" style="justify-content:center;">Enter Passcode</div>
+      <input type="password" id="passcode-input" class="passcode-input-box" maxlength="40" autocomplete="off">
+      <label class="checklist-label" style="justify-content:center; margin-top:8px;">
+        <input type="checkbox" id="passcode-show-chk" onchange="document.getElementById('passcode-input').type = this.checked ? 'text' : 'password';"> Show password
+      </label>
+      <div class="passcode-error-text" id="passcode-error">Incorrect passcode. Try again.</div>
+      <div class="modal-actions">
+        <button class="modal-btn modal-btn-primary" style="width:100%;" onclick="checkPasscode()">Unlock</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Firebase (compat build, loaded as plain scripts so the inline onclick handlers keep working) -->
+  <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
+
+  <script>
+    // =====================================================================================
+    // SETUP: paste the values from your Firebase project here (see SETUP-GUIDE.md, step 6).
+    // These are NOT secrets - they only identify your project. Your data is protected by the
+    // office login plus the rules in firestore.rules.
+    // =====================================================================================
+    const FIREBASE_CONFIG = {
+      apiKey: "PASTE_API_KEY_HERE",
+      authDomain: "PASTE_PROJECT_ID.firebaseapp.com",
+      projectId: "PASTE_PROJECT_ID",
+      appId: "PASTE_APP_ID"
+    };
+
+    // The single shared office login. It does not have to be a real email address - nothing is ever
+    // sent to it. It must match the email you create in Firebase Authentication AND the email in
+    // firestore.rules. The "passcode" staff type in is this account's password.
+    const OFFICE_EMAIL = "office@pegel-intercom.com";
+
+    // Staff type a short passcode (like 000). Firebase requires passwords of at least 6 characters, so
+    // this fixed text is added behind the scenes. The password you create in the Firebase console must be
+    // the passcode followed by this text (for example: 000pegel-intercom).
+    const PASSCODE_PAD = "pegel-intercom";
+
+    // true  = staff must enter the passcode (the database also requires the login).
+    // false = NO LOGIN: anyone who has the web address can use the intercom. Use this together with
+    //         firestore-open.rules (see "No-login mode" in the setup guide).
+    const REQUIRE_LOGIN = false;
+
+    const FIREBASE_READY = !/PASTE/.test(FIREBASE_CONFIG.apiKey);
+    let auth = null, db = null;
+    if (FIREBASE_READY) {
+      firebase.initializeApp(FIREBASE_CONFIG);
+      auth = firebase.auth();
+      db = firebase.firestore();
+    }
+
+    let selections = {};
+
+    let audioCtx = null;
+    let audioUnlocked = false;
+    let cachedData = [];
+    let firstLoad = true;
+    let knownTaskIds = new Set();
+    let globallyMuted = localStorage.getItem('dental_global_muted') === 'true';
+    let isEditingMode = false;
+    // Realtime listeners (started after sign-in, stopped on sign-out).
+    let unsubTasks = null;
+    let unsubSettings = null;
+    // The last shared-settings text this device applied or wrote, so a device never re-applies its own save.
+    let lastAppliedSettingsJson = null;
+    let seedingSharedSettings = false;
+
+    const defaultPers = ["Dr. Josh", "Dr. Terry", "Laura", "Christy", "Norma", "Other"];
+    const defaultStatus = ["Pt. Ready", "Pt. Here", "Perio Charting", "Exam", "Pt. Late", "Help Front Desk"];
+    const defaultRoom = ["Hyg1", "Hyg2", "Op3", "Op4", "Hyg5", "Op6", "Op7", "Op8"];
+
+    const FONT_FALLBACKS = {
+      'Assistant': 'sans-serif', 'Roboto': 'sans-serif', 'Open Sans': 'sans-serif', 'Inter': 'sans-serif',
+      'Montserrat': 'sans-serif', 'Lato': 'sans-serif', 'Nunito': 'sans-serif', 'Quicksand': 'sans-serif',
+      'Outfit': 'sans-serif', 'Lexend Deca': 'sans-serif', 'Roboto Mono': 'monospace',
+      'Playfair Display': 'serif', 'Roboto Slab': 'serif', 'Merriweather': 'serif', 'Comic Relief': 'cursive'
+    };
+
+    const SOUND_CODES = ["GAF", "GBG", "CAF", "CEE", "GGG", "AF", "FF", "EEC", "DD", "GC", "CG", "G", "D"];
+    const MESSAGE_ROOM_KEY = "__MESSAGE__";
+    const DEFAULT_CARD_COLORS = ["#69c2c8", "#cab0ed", "#cde293", "#8eb7f7"];
+    const MAX_VOLUME = 10; // slider ceiling: 1000%
+    const DEFAULT_FONT_SIZE = '20px';
+    const MIN_FONT_SIZE_PX = 14;
+    const MAX_FONT_SIZE_PX = 36;
+
+    let categories = JSON.parse(localStorage.getItem('dental_categories') || 'null');
+    if (!categories) {
+      let migPers = JSON.parse(localStorage.getItem('dental_custom_pers') || JSON.stringify(defaultPers));
+      let migStatus = JSON.parse(localStorage.getItem('dental_custom_status') || JSON.stringify(defaultStatus));
+      let migRoom = JSON.parse(localStorage.getItem('dental_custom_room') || JSON.stringify(defaultRoom));
+      let migOrder = JSON.parse(localStorage.getItem('dental_cat_order') || JSON.stringify(['pers', 'status', 'room']));
+      let itemMap = { pers: migPers, status: migStatus, room: migRoom };
+      categories = migOrder.map(k => ({ key: k, title: '', items: itemMap[k] || [] }));
+      localStorage.setItem('dental_categories', JSON.stringify(categories));
+    }
+    categories.forEach(c => { selections[c.key] = []; });
+
+    let buttonStyles = JSON.parse(localStorage.getItem('dental_btn_styles') || '{}');
+    let generalSettings = JSON.parse(localStorage.getItem('dental_general_settings') || JSON.stringify({
+      bg: '', fontSize: DEFAULT_FONT_SIZE, fontFamily: 'Assistant', sendBg: '#4485ca', sendText: '#ffffff',
+      msgBtnBg: '#333333', resetBtnBg: '#dc534c', settingsBtnBg: '#707070',
+      titleText: 'Pegel Family Dental', completionSound: false, messageCardColor: '#cab0ed', messageSound: 'ALARM_1',
+      volume: MAX_VOLUME
+    }));
+    if (generalSettings.fontFamily === undefined) generalSettings.fontFamily = 'Assistant';
+    if (generalSettings.completionSound === undefined) generalSettings.completionSound = false; // Default to mute
+    if (generalSettings.messageCardColor === undefined) generalSettings.messageCardColor = '#cab0ed';
+    if (generalSettings.messageSound === undefined) generalSettings.messageSound = 'ALARM_1';
+    if (generalSettings.msgBtnBg === undefined) generalSettings.msgBtnBg = '#333333';
+    if (generalSettings.resetBtnBg === undefined) generalSettings.resetBtnBg = '#dc534c';
+    if (generalSettings.settingsBtnBg === undefined) generalSettings.settingsBtnBg = '#707070';
+    if (generalSettings.titleText === undefined) generalSettings.titleText = 'Pegel Family Dental';
+    if (generalSettings.volume === undefined) generalSettings.volume = MAX_VOLUME; // default to loudest
+    if (generalSettings.fontSize === undefined) generalSettings.fontSize = DEFAULT_FONT_SIZE;
+
+    let stagingCategories = JSON.parse(JSON.stringify(categories));
+    let stagingButtonStyles = JSON.parse(JSON.stringify(buttonStyles));
+
+    // Default configuration helper for sound settings: by default all options are checked/subscribed
+    function getDefaultSoundConfig() {
+      let cfg = {};
+      categories.forEach(c => {
+        cfg[c.key] = [...c.items];
+      });
+      return cfg;
+    }
+
+    let savedConfig = JSON.parse(localStorage.getItem('dental_sound_config') || 'null');
+    if (!savedConfig) {
+      savedConfig = getDefaultSoundConfig();
+      localStorage.setItem('dental_sound_config', JSON.stringify(savedConfig));
+    } else {
+      // Ensure any newly added categories/items are defaulted to checked
+      categories.forEach(c => {
+        if (!savedConfig[c.key]) {
+          savedConfig[c.key] = [...c.items];
+        } else {
+          c.items.forEach(item => {
+            if (!savedConfig[c.key].includes(item)) {
+              savedConfig[c.key].push(item);
+            }
+          });
+        }
+      });
+    }
+
+    let currentEditingItem = null;
+
+    const NOTE_FREQS = {
+      'C': 523.25, 'C#': 554.37, 'D': 587.33, 'D#': 622.25,
+      'E': 659.25, 'F': 698.46, 'F#': 739.99, 'G': 783.99,
+      'G#': 830.61, 'A': 880.00, 'A#': 932.33, 'B': 987.77,
+      'C6': 1046.50, 'D6': 1174.66, 'E6': 1318.51
+    };
+
+    if (localStorage.getItem('dental_dark_mode') === null) {
+      localStorage.setItem('dental_dark_mode', 'true');
+    }
+    if (localStorage.getItem('dental_dark_mode') === 'true') {
+      document.body.classList.add('dark-mode');
+    }
+
+    function ensureDefaultStyles() {
+      const combined = [];
+      categories.forEach(cat => cat.items.forEach(item => combined.push(item)));
+
+      const defaultConfigs = {
+        "Dr. Josh": { sound: "GAF", card: "#3f98f8" },
+        "Dr. Terry": { sound: "CEE", card: "#e85454" },
+        "Norma": { sound: "GGG", card: "#c58adb" },
+        "Christy": { sound: "FF", card: "#f99adb" },
+        "Laura": { sound: "AF", card: "#6ebec4" },
+        "Other": { sound: "DD", card: "#8ebf45" },
+        "Pt. Ready": { sound: "CG", card: "#3abb8a" },
+        "Pt. Here": { sound: "D", card: "#7be000" },
+        "Perio Charting": { sound: "CAF", card: "#a536d9" },
+        "Exam": { sound: "GBG", card: "#e0c410" },
+        "Pt. Late": { sound: "G", card: "#ff961f" },
+        "Help Front Desk": { sound: "ALARM_2", card: "#ff0000" }
+      };
+
+      combined.forEach((item, i) => {
+        if (!buttonStyles[item]) buttonStyles[item] = {};
+        if (defaultConfigs[item]) {
+          if (!buttonStyles[item].sound) buttonStyles[item].sound = defaultConfigs[item].sound;
+          if (!buttonStyles[item].card) buttonStyles[item].card = defaultConfigs[item].card;
+        } else {
+          if (!buttonStyles[item].sound) buttonStyles[item].sound = SOUND_CODES[i % SOUND_CODES.length];
+          if (!buttonStyles[item].card) buttonStyles[item].card = DEFAULT_CARD_COLORS[i % DEFAULT_CARD_COLORS.length];
+        }
+      });
+
+      for (let key in defaultConfigs) {
+        if (buttonStyles[key]) {
+          if (!buttonStyles[key].sound || buttonStyles[key].sound === 'ALARM') {
+            buttonStyles[key].sound = defaultConfigs[key].sound;
+          }
+          if (!buttonStyles[key].card) {
+            buttonStyles[key].card = defaultConfigs[key].card;
+          }
+        }
+      }
+
+      localStorage.setItem('dental_btn_styles', JSON.stringify(buttonStyles));
+    }
+
+    ensureDefaultStyles();
+    stagingButtonStyles = JSON.parse(JSON.stringify(buttonStyles));
+
+    applyGeneralSettings();
+    updateThemeButtonText();
+    updateMuteButtonText();
+    renderControlPanel();
+    checkDeviceLock();
+
+    // ---------------- Connection banner ----------------
+    function setConnectionLost(lost) {
+      document.getElementById('connection-banner').style.display = lost ? 'block' : 'none';
+    }
+
+    // ---------------- Sign-in (shared office login) ----------------
+    function showPasscodeOverlay(message) {
+      const overlay = document.getElementById('passcode-overlay');
+      overlay.style.display = 'flex';
+      const input = document.getElementById('passcode-input');
+      input.value = '';
+      input.type = 'password';
+      document.getElementById('passcode-show-chk').checked = false;
+      const err = document.getElementById('passcode-error');
+      if (message) {
+        err.textContent = message;
+        err.style.display = 'block';
+      } else {
+        err.style.display = 'none';
+      }
+      setTimeout(() => input.focus(), 200);
+    }
+
+    function hidePasscodeOverlay() {
+      document.getElementById('passcode-overlay').style.display = 'none';
+    }
+
+
+    function checkDeviceLock() {
+      document.getElementById('passcode-input').addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') checkPasscode();
+      });
+      window.addEventListener('offline', function () { setConnectionLost(true); });
+      if (!REQUIRE_LOGIN) document.getElementById('menu-change-password-btn').style.display = 'none';
+
+      if (!FIREBASE_READY) {
+        showPasscodeOverlay('Setup incomplete: paste your Firebase settings at the top of index.html (see the setup guide).');
+        return;
+      }
+      if (!REQUIRE_LOGIN) { // no-login mode: go straight to the live data
+        hidePasscodeOverlay();
+        startListeners();
+        return;
+      }
+      auth.onAuthStateChanged(function (user) {
+        if (user && user.email === OFFICE_EMAIL) {
+          hidePasscodeOverlay();
+          startListeners();
+        } else {
+          stopListeners();
+          cachedData = [];
+          lastRenderedSignature = null;
+          updateUI(cachedData);
+          if (user) auth.signOut(); // some other account - never allowed
+          showPasscodeOverlay();
+        }
+      });
+    }
+
+    function checkPasscode() {
+      if (!FIREBASE_READY) return;
+      const input = document.getElementById('passcode-input');
+      const val = input.value;
+      const errEl = document.getElementById('passcode-error');
+      if (!val) return;
+      errEl.style.display = 'none';
+
+      auth.signInWithEmailAndPassword(OFFICE_EMAIL, val + PASSCODE_PAD)
+        .then(function () {
+          input.value = ''; // the sign-in listener closes the overlay and starts the live data
+        })
+        .catch(function (e) {
+          let msg;
+          if (e.code === 'auth/too-many-requests') msg = 'Too many attempts. Wait a few minutes and try again.';
+          else if (e.code === 'auth/network-request-failed') msg = 'No internet connection.';
+          else if (e.code === 'auth/invalid-credential' || e.code === 'auth/wrong-password' || e.code === 'auth/user-not-found' || e.code === 'auth/invalid-login-credentials' || e.code === 'auth/invalid-email') msg = 'Incorrect passcode. Try again.';
+          else msg = 'Could not sign in: ' + e.message;
+          errEl.textContent = msg;
+          errEl.style.display = 'block';
+          input.value = '';
+          input.focus();
+        });
+    }
+
+    function toggleChangePasswordVisibility() {
+      const type = document.getElementById('cp-show-chk').checked ? 'text' : 'password';
+      document.getElementById('cp-current').type = type;
+      document.getElementById('cp-new1').type = type;
+      document.getElementById('cp-new2').type = type;
+    }
+
+    function openChangePasswordModal() {
+      document.getElementById('cp-current').value = '';
+      document.getElementById('cp-new1').value = '';
+      document.getElementById('cp-new2').value = '';
+      document.getElementById('cp-error').style.display = 'none';
+      document.getElementById('cp-show-chk').checked = false;
+      toggleChangePasswordVisibility();
+      document.getElementById('change-password-modal').style.display = 'flex';
+    }
+
+    function closeChangePasswordModal() {
+      document.getElementById('change-password-modal').style.display = 'none';
+    }
+
+    function submitChangePassword() {
+      const cur = document.getElementById('cp-current').value;
+      const n1 = document.getElementById('cp-new1').value;
+      const n2 = document.getElementById('cp-new2').value;
+      const errEl = document.getElementById('cp-error');
+      errEl.style.display = 'none';
+
+      if (!cur) { errEl.textContent = "Enter your current password."; errEl.style.display = 'block'; return; }
+      if (!n1) { errEl.textContent = "Enter a new password."; errEl.style.display = 'block'; return; }
+      if (n1 !== n2) { errEl.textContent = "New passwords do not match."; errEl.style.display = 'block'; return; }
+
+      const user = auth && auth.currentUser;
+      if (!user) { errEl.textContent = "Not signed in."; errEl.style.display = 'block'; return; }
+
+      const cred = firebase.auth.EmailAuthProvider.credential(OFFICE_EMAIL, cur + PASSCODE_PAD);
+      user.reauthenticateWithCredential(cred)
+        .then(function () { return user.updatePassword(n1 + PASSCODE_PAD); })
+        .then(function () {
+          closeChangePasswordModal();
+          alert("Password changed. Other devices will be asked to enter the new password the next time they refresh their sign-in (within about an hour) or when they are reopened.");
+        })
+        .catch(function (e) {
+          if (e.code === 'auth/invalid-credential' || e.code === 'auth/wrong-password' || e.code === 'auth/invalid-login-credentials') {
+            errEl.textContent = "Current password is incorrect.";
+          } else if (e.code === 'auth/weak-password') {
+            errEl.textContent = "That password is too weak. Use at least 6 characters.";
+          } else {
+            errEl.textContent = "Error: " + e.message;
+          }
+          errEl.style.display = 'block';
+        });
+    }
+
+    function applyGeneralSettings() {
+      if (generalSettings.bg) {
+        document.body.style.setProperty('--bg-color', generalSettings.bg);
+      } else {
+        document.body.style.removeProperty('--bg-color');
+      }
+      if (generalSettings.fontSize) {
+        document.documentElement.style.setProperty('--base-font-size', generalSettings.fontSize);
+      }
+      if (generalSettings.fontFamily) {
+        let fallback = FONT_FALLBACKS[generalSettings.fontFamily] || 'sans-serif';
+        document.body.style.setProperty('--font-family', `'${generalSettings.fontFamily}',${fallback}`);
+      }
+      if (generalSettings.sendBg) {
+        document.documentElement.style.setProperty('--send-btn-bg', generalSettings.sendBg);
+      }
+      if (generalSettings.sendText) {
+        document.documentElement.style.setProperty('--send-btn-text', generalSettings.sendText);
+      }
+      
+      if (generalSettings.msgBtnBg) {
+        document.documentElement.style.setProperty('--message-btn-bg', generalSettings.msgBtnBg);
+        document.documentElement.style.setProperty('--message-btn-text', '#ffffff');
+        document.documentElement.style.setProperty('--custom-msg-btn-bg', generalSettings.msgBtnBg);
+        document.documentElement.style.setProperty('--custom-msg-btn-text', '#ffffff');
+      } else {
+        document.documentElement.style.removeProperty('--message-btn-bg');
+        document.documentElement.style.removeProperty('--message-btn-text');
+        document.documentElement.style.removeProperty('--custom-msg-btn-bg');
+        document.documentElement.style.removeProperty('--custom-msg-btn-text');
+      }
+      
+      if (generalSettings.resetBtnBg) {
+        document.documentElement.style.setProperty('--reset-btn-bg', generalSettings.resetBtnBg);
+        document.documentElement.style.setProperty('--reset-btn-text', '#ffffff');
+        document.documentElement.style.setProperty('--custom-reset-btn-bg', generalSettings.resetBtnBg);
+        document.documentElement.style.setProperty('--custom-reset-btn-text', '#ffffff');
+      } else {
+        document.documentElement.style.removeProperty('--reset-btn-bg');
+        document.documentElement.style.removeProperty('--reset-btn-text');
+        document.documentElement.style.removeProperty('--custom-reset-btn-bg');
+        document.documentElement.style.removeProperty('--custom-reset-btn-text');
+      }
+      
+      if (generalSettings.settingsBtnBg) {
+        document.documentElement.style.setProperty('--settings-btn-bg', generalSettings.settingsBtnBg);
+        document.documentElement.style.setProperty('--settings-btn-text', '#ffffff');
+        document.documentElement.style.setProperty('--custom-settings-btn-bg', generalSettings.settingsBtnBg);
+        document.documentElement.style.setProperty('--custom-settings-btn-text', '#ffffff');
+      } else {
+        document.documentElement.style.removeProperty('--settings-btn-bg');
+        document.documentElement.style.removeProperty('--settings-btn-text');
+        document.documentElement.style.removeProperty('--custom-settings-btn-bg');
+        document.documentElement.style.removeProperty('--custom-settings-btn-text');
+      }
+
+      const titleEl = document.getElementById('app-title-display');
+      if (titleEl) {
+        titleEl.textContent = generalSettings.titleText !== undefined ? generalSettings.titleText : 'Pegel Family Dental';
+        titleEl.style.display = (generalSettings.titleText && generalSettings.titleText.trim() !== '') ? 'block' : 'none';
+      }
+    }
+
+    function useAutomaticBackground() {
+      document.getElementById('modal-general-bg-hex').value = '';
+      let isDark = document.body.classList.contains('dark-mode');
+      document.getElementById('modal-general-bg-picker').value = isDark ? '#121212' : '#f4f6f9';
+    }
+
+    function toggleTheme() {
+      document.body.classList.toggle('dark-mode');
+      const isDark = document.body.classList.contains('dark-mode');
+      localStorage.setItem('dental_dark_mode', isDark);
+      updateThemeButtonText();
+      renderControlPanel();
+    }
+
+    function updateThemeButtonText() {
+      const isDark = document.body.classList.contains('dark-mode');
+      const modalBtn = document.getElementById('modal-theme-toggle-btn');
+      if (modalBtn) modalBtn.textContent = isDark ? 'Switch to Light Mode' : 'Switch to Dark Mode';
+    }
+
+    function toggleGlobalMute() {
+      globallyMuted = !globallyMuted;
+      localStorage.setItem('dental_global_muted', globallyMuted);
+      updateMuteButtonText();
+      unlockAudio();
+    }
+
+    function updateMuteButtonText() {
+      const btn = document.getElementById('menu-mute-btn');
+      if (btn) {
+        if (globallyMuted) {
+          btn.textContent = 'Unmute All Sounds';
+          btn.classList.add('muted-active');
+        } else {
+          btn.textContent = 'Mute All Sounds';
+          btn.classList.remove('muted-active');
+        }
+      }
+    }
+
+    function toggleCompletionSoundSetting() {
+      generalSettings.completionSound = document.getElementById('modal-completion-sound-chk').checked;
+      localStorage.setItem('dental_general_settings', JSON.stringify(generalSettings));
+    }
+
+    function saveMessageSoundSetting() {
+      generalSettings.messageSound = document.getElementById('modal-message-sound').value;
+      localStorage.setItem('dental_general_settings', JSON.stringify(generalSettings));
+      syncSharedSettings();
+    }
+
+    function updateVolumeDisplay(val) {
+      document.getElementById('volume-value-display').textContent = Math.round(val * 100) + '%';
+    }
+
+    let volumePreviewTimeout = null;
+    function previewVolumeChange() {
+      // Light debounce so dragging the slider doesn't fire a burst of overlapping tones.
+      unlockAudio();
+      clearTimeout(volumePreviewTimeout);
+      volumePreviewTimeout = setTimeout(function () {
+        let val = parseFloat(document.getElementById('modal-volume-slider').value);
+        try {
+          if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+          const now = audioCtx.currentTime;
+          playTone(783.99, now, 0.18, val);
+        } catch (e) {}
+      }, 120);
+    }
+
+    function saveVolumeSetting(val) {
+      generalSettings.volume = parseFloat(val);
+      localStorage.setItem('dental_general_settings', JSON.stringify(generalSettings));
+    }
+
+    function openMainSettingsModal() {
+      document.getElementById('menu-edit-mode-btn').style.display = isEditingMode ? 'none' : 'block';
+      document.getElementById('main-settings-modal').style.display = 'flex';
+    }
+    function closeMainSettingsModal() {
+      document.getElementById('main-settings-modal').style.display = 'none';
+    }
+
+    function startEditMode() {
+      isEditingMode = true;
+      document.body.classList.add('editing-active');
+      stagingCategories = JSON.parse(JSON.stringify(categories));
+      stagingButtonStyles = JSON.parse(JSON.stringify(buttonStyles));
+      renderControlPanel();
+    }
+
+    function saveEditMode() {
+      categories = JSON.parse(JSON.stringify(stagingCategories));
+      buttonStyles = JSON.parse(JSON.stringify(stagingButtonStyles));
+
+      localStorage.setItem('dental_categories', JSON.stringify(categories));
+      localStorage.setItem('dental_btn_styles', JSON.stringify(buttonStyles));
+
+      let newSelections = {};
+      categories.forEach(c => { newSelections[c.key] = selections[c.key] || []; });
+      selections = newSelections;
+      categories.forEach(c => { if (!savedConfig[c.key]) savedConfig[c.key] = [...c.items]; });
+
+      isEditingMode = false;
+      document.body.classList.remove('editing-active');
+      renderControlPanel();
+      syncSharedSettings();
+    }
+
+    function discardEditMode() {
+      isEditingMode = false;
+      document.body.classList.remove('editing-active');
+      renderControlPanel();
+    }
+
+    function resetAllSettings() {
+      if (!confirm("Reset all sections, buttons, names, layouts, colors, and settings back to default? (Active requests are not affected.)")) return;
+
+      let keepDeviceUnlockHash = localStorage.getItem('dental_unlocked_passcode_hash');
+      localStorage.clear();
+      if (keepDeviceUnlockHash) localStorage.setItem('dental_unlocked_passcode_hash', keepDeviceUnlockHash);
+
+      categories = [
+        { key: 'pers', title: '', items: [...defaultPers] },
+        { key: 'status', title: '', items: [...defaultStatus] },
+        { key: 'room', title: '', items: [...defaultRoom] }
+      ];
+      buttonStyles = {};
+      generalSettings = { bg: '', fontSize: DEFAULT_FONT_SIZE, fontFamily: 'Assistant', sendBg: '#4485ca', sendText: '#ffffff', msgBtnBg: '#333333', resetBtnBg: '#dc534c', settingsBtnBg: '#707070', titleText: 'Pegel Family Dental', completionSound: false, messageCardColor: '#cab0ed', messageSound: 'ALARM_1', volume: MAX_VOLUME };
+      savedConfig = getDefaultSoundConfig();
+      globallyMuted = false;
+
+      ensureDefaultStyles();
+
+      selections = {};
+      categories.forEach(c => { selections[c.key] = []; });
+
+      localStorage.setItem('dental_categories', JSON.stringify(categories));
+      localStorage.setItem('dental_general_settings', JSON.stringify(generalSettings));
+      localStorage.setItem('dental_sound_config', JSON.stringify(savedConfig));
+      localStorage.setItem('dental_dark_mode', 'true');
+      localStorage.setItem('dental_global_muted', 'false');
+
+      stagingCategories = JSON.parse(JSON.stringify(categories));
+      stagingButtonStyles = JSON.parse(JSON.stringify(buttonStyles));
+
+      if (!document.body.classList.contains('dark-mode')) document.body.classList.add('dark-mode');
+      applyGeneralSettings();
+      updateThemeButtonText();
+      updateMuteButtonText();
+      isEditingMode = false;
+      document.body.classList.remove('editing-active');
+      closeMainSettingsModal();
+      renderControlPanel();
+      syncSharedSettings();
+    }
+
+    function moveCategory(index, direction) {
+      let targetIdx = index + direction;
+      if (targetIdx < 0 || targetIdx >= stagingCategories.length) return;
+      let tmp = stagingCategories[index];
+      stagingCategories[index] = stagingCategories[targetIdx];
+      stagingCategories[targetIdx] = tmp;
+      renderControlPanel();
+    }
+
+    function renameCategory(index) {
+      let cat = stagingCategories[index];
+      let newTitle = prompt("Enter a new title for this section (leave blank to hide the title, keeping the buttons):", cat.title || '');
+      if (newTitle === null) return;
+      cat.title = newTitle.trim();
+      renderControlPanel();
+    }
+
+    function deleteCategory(index) {
+      let cat = stagingCategories[index];
+      if (!confirm(`Delete the entire "${cat.title || 'Untitled'}" section and all of its buttons?`)) return;
+      stagingCategories.splice(index, 1);
+      renderControlPanel();
+    }
+
+    function addCategory() {
+      let title = prompt("Enter a name for the new section (e.g. \"Equipment\"):");
+      if (title === null) return;
+      title = title.trim();
+      if (!title) { alert("Please enter a section name."); return; }
+      let key = 'cat_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
+      stagingCategories.push({ key: key, title: title, items: [] });
+      renderControlPanel();
+    }
+
+    function moveItem(catIndex, idx, direction) {
+      let items = stagingCategories[catIndex].items;
+      let targetIdx = idx + direction;
+      if (targetIdx < 0 || targetIdx >= items.length) return;
+      let tmp = items[idx];
+      items[idx] = items[targetIdx];
+      items[targetIdx] = tmp;
+      renderControlPanel();
+    }
+
+    function addItem(catIndex) {
+      let cat = stagingCategories[catIndex];
+      let name = prompt(`Enter a name for the new item in "${cat.title || 'this section'}":`);
+      if (!name || !name.trim()) return;
+      name = name.trim();
+      if (!cat.items.includes(name)) cat.items.push(name);
+      renderControlPanel();
+    }
+
+    function renderControlPanel() {
+      const container = document.getElementById('categories-container');
+      container.innerHTML = '';
+
+      let activeCategories = isEditingMode ? stagingCategories : categories;
+      let isDark = document.body.classList.contains('dark-mode');
+
+      activeCategories.forEach((cat, catIndex) => {
+        let items = cat.items;
+        let hasTitle = cat.title && cat.title.trim() !== '';
+
+        let moveUpBtn = catIndex > 0 ? `<button class="cat-order-btn" onclick="moveCategory(${catIndex}, -1)">Move Up</button>` : '';
+        let moveDownBtn = catIndex < activeCategories.length - 1 ? `<button class="cat-order-btn" onclick="moveCategory(${catIndex}, 1)">Move Down</button>` : '';
+        let renameBtn = `<button class="cat-order-btn" onclick="renameCategory(${catIndex})">Rename</button>`;
+        let deleteSectionBtn = `<button class="cat-order-btn danger" onclick="deleteCategory(${catIndex})">Delete Section</button>`;
+
+        let titleBlockHtml;
+        if (hasTitle || isEditingMode) {
+          let titleLabel = hasTitle ? cat.title : '<span style="opacity:0.55; font-style:italic;">(no title)</span>';
+          titleBlockHtml = `
+            <div class="section-title" style="margin-top:${catIndex === 0 ? '0' : '15px'};">
+              <span>${titleLabel}</span>
+              <div class="category-edit-controls">
+                ${moveUpBtn}${moveDownBtn}
+                ${renameBtn}${deleteSectionBtn}
+              </div>
+              <div class="add-btn-wrapper"><button class="add-item-btn" onclick="addItem(${catIndex})">+ Add Item</button></div>
+            </div>
+          `;
+        } else {
+          titleBlockHtml = `<div style="height:${catIndex === 0 ? '0px' : '15px'};"></div>`;
+        }
+
+        container.innerHTML += titleBlockHtml + `<div class="builder-row" id="row-cat-${catIndex}"></div>`;
+
+        let rowContainer = document.getElementById(`row-cat-${catIndex}`);
+        items.forEach((item, idx) => {
+          let isSel = (selections[cat.key] || []).includes(item);
+
+          let customStyle = "";
+          let stylesMap = isEditingMode ? stagingButtonStyles : buttonStyles;
+          if (stylesMap[item] && stylesMap[item].bg) {
+            customStyle = `background: ${stylesMap[item].bg}; color: #ffffff;`;
+          } else {
+            let defaultBg = isDark ? '#333333' : '#e0e0e0';
+            let defaultText = isDark ? '#e0e0e0' : '#333333';
+            customStyle = `background: ${defaultBg}; color:${defaultText};`;
+          }
+
+          let btnWrapper = document.createElement('div');
+          btnWrapper.className = 'builder-btn-wrapper';
+
+          let safeItem = item.replace(/'/g, "\\'");
+          let clickFn = `toggleItem('${cat.key}', '${safeItem}', this)`;
+
+          let leftBtn = idx > 0 ? `<button class="item-edit-btn" onclick="moveItem(${catIndex},${idx}, -1)" title="Move left">&lt;</button>` : `<span></span>`;
+          let rightBtn = idx < items.length - 1 ? `<button class="item-edit-btn" onclick="moveItem(${catIndex},${idx}, 1)" title="Move right">&gt;</button>` : `<span></span>`;
+
+          let btnHtml = `
+            <button class="builder-btn ${isSel ? 'selected' : ''}" style="${customStyle}" onclick="${clickFn}">${item}</button>
+            <div class="item-edit-bar">
+              ${leftBtn}
+              <button class="item-edit-btn" onclick="openButtonModal(${catIndex}, '${safeItem}')" title="Edit">&#9881;</button>
+              ${rightBtn}
+            </div>
+          `;
+          btnWrapper.innerHTML = btnHtml;
+          rowContainer.appendChild(btnWrapper);
+        });
+      });
+    }
+
+    function toggleItem(catKey, item, btn) {
+      if (!selections[catKey]) selections[catKey] = [];
+      const idx = selections[catKey].indexOf(item);
+      if (idx > -1) {
+        selections[catKey].splice(idx, 1);
+        btn.classList.remove('selected');
+      } else {
+        selections[catKey].push(item);
+        btn.classList.add('selected');
+      }
+    }
+
+    function openButtonModal(catIndex, name) {
+      currentEditingItem = { catIndex: catIndex, name: name };
+      document.getElementById('modal-edit-item-name').textContent = `(${name})`;
+      document.getElementById('modal-input-name').value = name;
+
+      let st = stagingButtonStyles[name] || {};
+      let btnCol = st.bg || '';
+      let cardCol = st.card || '#69c2c8';
+      let soundChoice = st.sound || 'GAF';
+
+      document.getElementById('modal-input-btn-color').value = btnCol || '#333333';
+      document.getElementById('modal-hex-btn-color').value = btnCol;
+      document.getElementById('modal-input-card-color').value = cardCol;
+      document.getElementById('modal-hex-card-color').value = cardCol;
+      document.getElementById('modal-input-sound').value = soundChoice;
+
+      updateModalPreview();
+      document.getElementById('button-edit-modal').style.display = 'flex';
+    }
+
+    function closeButtonModal() {
+      document.getElementById('button-edit-modal').style.display = 'none';
+      currentEditingItem = null;
+    }
+
+    function syncColorInput(target) {
+      if (target === 'btn') {
+        let val = document.getElementById('modal-input-btn-color').value;
+        document.getElementById('modal-hex-btn-color').value = val;
+      } else {
+        let val = document.getElementById('modal-input-card-color').value;
+        document.getElementById('modal-hex-card-color').value = val;
+      }
+    }
+
+    function syncColorPicker(target) {
+      if (target === 'btn') {
+        let val = document.getElementById('modal-hex-btn-color').value;
+        if (/^#[0-9A-F]{6}$/i.test(val)) document.getElementById('modal-input-btn-color').value = val;
+      } else {
+        let val = document.getElementById('modal-hex-card-color').value;
+        if (/^#[0-9A-F]{6}$/i.test(val)) document.getElementById('modal-input-card-color').value = val;
+      }
+    }
+
+    function clearButtonCustomColor() {
+      document.getElementById('modal-hex-btn-color').value = '';
+      updateModalPreview();
+    }
+
+    function resetColorToDefault(target, mode) {
+      let defVal = '#69c2c8';
+      if (target === 'card') {
+        defVal = (mode === 'dark') ? '#8eb7f7' : '#69c2c8';
+        document.getElementById('modal-input-card-color').value = defVal;
+        document.getElementById('modal-hex-card-color').value = defVal;
+      }
+      updateModalPreview();
+    }
+
+    function matchButtonAndCardColors() {
+      let btnCol = document.getElementById('modal-input-btn-color').value;
+      document.getElementById('modal-input-card-color').value = btnCol;
+      document.getElementById('modal-hex-card-color').value = btnCol;
+      updateModalPreview();
+    }
+
+    function updateModalPreview() {
+      let name = document.getElementById('modal-input-name').value || 'Sample';
+      let btnCol = document.getElementById('modal-hex-btn-color').value;
+      let cardCol = document.getElementById('modal-input-card-color').value;
+      let isDark = document.body.classList.contains('dark-mode');
+
+      let prevBtn = document.getElementById('preview-btn-element');
+      let prevCard = document.getElementById('preview-card-element');
+
+      prevBtn.textContent = name;
+      prevBtn.style.background = btnCol ? btnCol : (isDark ? '#333333' : '#e0e0e0');
+      prevBtn.style.color = btnCol ? '#ffffff' : (isDark ? '#e0e0e0' : '#333333');
+
+      prevCard.style.borderLeftColor = cardCol;
+      prevCard.textContent = `Room 1 \u2022 ${name}`;
+    }
+
+    function previewSelectedSound(soundType) {
+      unlockAudio();
+      playChosenSound(soundType);
+    }
+
+    function playNoteSequence(code) {
+      try {
+        if (!audioCtx) return;
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+        const now = audioCtx.currentTime;
+
+        if (code === 'ALARM_1' || code === 'ALARM') {
+          playTone(783.99, now, 0.9);
+          return;
+        }
+
+        if (code === 'ALARM_2') {
+          playTone(783.99, now, 0.9);
+          playTone(783.99, now + 1.0, 0.9);
+          return;
+        }
+
+        const letters = code.split('');
+        letters.forEach((letter, idx) => {
+          let freq = NOTE_FREQS[letter] || 440;
+          playTone(freq, now + (idx * 0.16), 0.14);
+        });
+      } catch (e) {}
+    }
+
+    function playChosenSound(soundType) {
+      if (!soundType || soundType === 'none') return;
+      playNoteSequence(soundType);
+    }
+
+    function saveButtonModal() {
+      if (!currentEditingItem) return;
+      let oldName = currentEditingItem.name;
+      let newName = document.getElementById('modal-input-name').value.trim();
+      let btnColor = document.getElementById('modal-hex-btn-color').value.trim();
+      let cardColor = document.getElementById('modal-input-card-color').value;
+      let soundType = document.getElementById('modal-input-sound').value;
+
+      if (!newName) { alert("Name cannot be empty."); return; }
+
+      let cat = stagingCategories[currentEditingItem.catIndex];
+      let idx = cat.items.indexOf(oldName);
+      if (idx > -1) cat.items[idx] = newName;
+
+      if (!stagingButtonStyles[newName]) stagingButtonStyles[newName] = {};
+      stagingButtonStyles[newName].bg = btnColor;
+      stagingButtonStyles[newName].card = cardColor;
+      stagingButtonStyles[newName].sound = soundType;
+
+      if (oldName !== newName && stagingButtonStyles[oldName]) delete stagingButtonStyles[oldName];
+
+      closeButtonModal();
+      renderControlPanel();
+    }
+
+    function deleteItemFromModal() {
+      if (!currentEditingItem) return;
+      if (!confirm(`Delete "${currentEditingItem.name}"?`)) return;
+
+      let cat = stagingCategories[currentEditingItem.catIndex];
+      cat.items = cat.items.filter(i => i !== currentEditingItem.name);
+
+      closeButtonModal();
+      renderControlPanel();
+    }
+
+    function openGeneralSettingsModal() {
+      document.getElementById('modal-general-title').value = generalSettings.titleText !== undefined ? generalSettings.titleText : 'Pegel Family Dental';
+      document.getElementById('modal-general-bg-picker').value = generalSettings.bg || (document.body.classList.contains('dark-mode') ? '#121212' : '#f4f6f9');
+      document.getElementById('modal-general-bg-hex').value = generalSettings.bg || '';
+      let currentFontPx = parseInt(generalSettings.fontSize || DEFAULT_FONT_SIZE, 10) || 20;
+      document.getElementById('modal-general-fontsize').value = currentFontPx;
+      document.getElementById('fontsize-value-display').textContent = currentFontPx + 'px';
+      document.getElementById('modal-general-font').value = generalSettings.fontFamily || 'Assistant';
+      document.getElementById('modal-message-color-picker').value = generalSettings.messageCardColor || '#cab0ed';
+      document.getElementById('modal-message-color-hex').value = generalSettings.messageCardColor || '#cab0ed';
+
+      document.getElementById('modal-send-bg-picker').value = generalSettings.sendBg || '#4485ca';
+      document.getElementById('modal-send-bg-hex').value = generalSettings.sendBg || '#4485ca';
+      document.getElementById('modal-send-text-picker').value = generalSettings.sendText || '#ffffff';
+      document.getElementById('modal-send-text-hex').value = generalSettings.sendText || '#ffffff';
+
+      document.getElementById('modal-msg-btn-bg-picker').value = generalSettings.msgBtnBg || '#333333';
+      document.getElementById('modal-msg-btn-bg-hex').value = generalSettings.msgBtnBg || '';
+      document.getElementById('modal-reset-btn-bg-picker').value = generalSettings.resetBtnBg || '#dc534c';
+      document.getElementById('modal-reset-btn-bg-hex').value = generalSettings.resetBtnBg || '';
+      document.getElementById('modal-settings-btn-bg-picker').value = generalSettings.settingsBtnBg || '#707070';
+      document.getElementById('modal-settings-btn-bg-hex').value = generalSettings.settingsBtnBg || '';
+
+      updateThemeButtonText();
+      document.getElementById('general-settings-modal').style.display = 'flex';
+    }
+
+    function closeGeneralSettingsModal() {
+      document.getElementById('general-settings-modal').style.display = 'none';
+    }
+
+    function saveGeneralSettings() {
+      generalSettings.titleText = document.getElementById('modal-general-title').value.trim();
+      generalSettings.bg = document.getElementById('modal-general-bg-hex').value.trim();
+      generalSettings.fontSize = document.getElementById('modal-general-fontsize').value + 'px';
+      generalSettings.fontFamily = document.getElementById('modal-general-font').value;
+      generalSettings.messageCardColor = document.getElementById('modal-message-color-hex').value.trim() || '#cab0ed';
+      generalSettings.sendBg = document.getElementById('modal-send-bg-hex').value.trim();
+      generalSettings.sendText = document.getElementById('modal-send-text-hex').value.trim();
+      generalSettings.msgBtnBg = document.getElementById('modal-msg-btn-bg-hex').value.trim();
+      generalSettings.resetBtnBg = document.getElementById('modal-reset-btn-bg-hex').value.trim();
+      generalSettings.settingsBtnBg = document.getElementById('modal-settings-btn-bg-hex').value.trim();
+
+      localStorage.setItem('dental_general_settings', JSON.stringify(generalSettings));
+      applyGeneralSettings();
+      closeGeneralSettingsModal();
+      syncSharedSettings();
+    }
+
+    function openSoundModal() {
+      unlockAudio();
+      updateMuteButtonText();
+      document.getElementById('modal-completion-sound-chk').checked = generalSettings.completionSound === true;
+      document.getElementById('modal-message-sound').value = generalSettings.messageSound || 'ALARM_1';
+      let vol = generalSettings.volume || MAX_VOLUME;
+      document.getElementById('modal-volume-slider').value = vol;
+      updateVolumeDisplay(vol);
+
+      const container = document.getElementById('sound-modal-groups');
+      container.innerHTML = '';
+
+      categories.forEach(cat => {
+        if (!savedConfig[cat.key]) savedConfig[cat.key] = [...cat.items];
+        let title = (cat.title && cat.title.trim() !== '') ? cat.title : 'Untitled Section';
+        let groupHtml = `<div class="checklist-group"><div style="font-weight:bold; font-size:0.8125rem; margin-bottom:4px;">${title}:</div>`;
+        cat.items.forEach(item => {
+          let checked = savedConfig[cat.key].includes(item) ? 'checked' : '';
+          let safeItem = item.replace(/"/g, '&quot;');
+          groupHtml += `<label class="checklist-label"><input type="checkbox" class="sound-chk" data-cat="${cat.key}" value="${safeItem}" ${checked}>${item}</label>`;
+        });
+        groupHtml += `</div>`;
+        container.innerHTML += groupHtml;
+      });
+
+      document.getElementById('sound-modal').style.display = 'flex';
+    }
+
+    function closeSoundModal() {
+      categories.forEach(cat => { savedConfig[cat.key] = []; });
+      document.querySelectorAll('.sound-chk').forEach(chk => {
+        if (chk.checked) {
+          let catKey = chk.getAttribute('data-cat');
+          if (!savedConfig[catKey]) savedConfig[catKey] = [];
+          savedConfig[catKey].push(chk.value);
+        }
+      });
+      localStorage.setItem('dental_sound_config', JSON.stringify(savedConfig));
+      document.getElementById('sound-modal').style.display = 'none';
+    }
+
+    function unlockAudio() {
+      if (audioUnlocked) return;
+      try {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        audioUnlocked = true;
+      } catch (e) {}
+    }
+    document.addEventListener('click', unlockAudio, { once: true });
+    document.addEventListener('touchstart', unlockAudio, { once: true });
+
+    function evaluateAndPlaySoundBatch(entries) {
+      if (globallyMuted || !audioUnlocked || !audioCtx) return;
+      if (!entries || entries.length === 0) return;
+
+      for (let e of entries) {
+        let room = e.room || '';
+        let personnelStr = e.personnel || 'None';
+        let statusStr = e.status || '';
+
+        let persList = personnelStr.split(",").map(s => s.trim()).filter(s => s && s !== "None");
+        let statusList = statusStr.split(",").map(s => s.trim()).filter(s => s && s !== "Idle");
+
+        // 1. Check "Help Front Desk" exception rule:
+        // Always goes off unless unselected in the sound settings.
+        if (statusList.includes("Help Front Desk")) {
+          let hfdSubscribed = true;
+          for (let cat of categories) {
+            if (cat.key !== 'room') {
+              if (cat.items.includes("Help Front Desk")) {
+                hfdSubscribed = (savedConfig[cat.key] || []).includes("Help Front Desk");
+                break;
+              }
+            }
+          }
+          if (hfdSubscribed) {
+            let hfdStyle = buttonStyles["Help Front Desk"];
+            if (hfdStyle && hfdStyle.sound && hfdStyle.sound !== 'none') {
+              playChosenSound(hfdStyle.sound);
+            } else {
+              playNoteSequence('ALARM_2');
+            }
+            return;
+          }
+        }
+
+        // 2. Check person button override logic:
+        // If a person is involved, check if this tablet is subscribed to that person.
+        // Even if the room doesn't match the tablet's room, a subscribed person triggers the sound
+        // unless explicitly unsubscribed in settings.
+        let personTriggered = false;
+        for (let p of persList) {
+          let pSubscribed = true;
+          for (let cat of categories) {
+            if (cat.key === 'pers' || (cat.items.includes(p) && cat.key !== 'room')) {
+              pSubscribed = (savedConfig[cat.key] || []).includes(p);
+              break;
+            }
+          }
+          if (pSubscribed) {
+            personTriggered = true;
+            let pStyle = buttonStyles[p];
+            if (pStyle && pStyle.sound && pStyle.sound !== 'none') {
+              playChosenSound(pStyle.sound);
+            } else {
+              playNoteSequence('GAF');
+            }
+            return;
+          }
+        }
+
+        // 3. Room & Status matching logic (when person button is not selected or not triggered):
+        // User must be subscribed to the specific room, AND at least one of the statuses must be subscribed.
+        if (room) {
+          let roomSubscribed = (savedConfig['room'] || []).includes(room);
+          if (!roomSubscribed) {
+            continue; // Skip notifications for rooms this tablet isn't subscribed to (e.g., Hyg2 vs Op1)
+          }
+
+          let statusMatched = false;
+          for (let st of statusList) {
+            let stSubscribed = true;
+            for (let cat of categories) {
+              if (cat.key !== 'room' && cat.items.includes(st)) {
+                stSubscribed = (savedConfig[cat.key] || []).includes(st);
+                break;
+              }
+            }
+            if (stSubscribed) {
+              statusMatched = true;
+              break;
+            }
+          }
+
+          if (statusMatched) {
+            // Play status or room sound
+            let played = false;
+            for (let st of statusList) {
+              if (buttonStyles[st] && buttonStyles[st].sound && buttonStyles[st].sound !== 'none') {
+                playChosenSound(buttonStyles[st].sound);
+                played = true;
+                break;
+              }
+            }
+            if (!played && buttonStyles[room] && buttonStyles[room].sound && buttonStyles[room].sound !== 'none') {
+              playChosenSound(buttonStyles[room].sound);
+              played = true;
+            }
+            if (!played) {
+              playNoteSequence('CEE');
+            }
+            return;
+          }
+        }
+      }
+    }
+
+    function playCompletionTone() {
+      if (globallyMuted || !audioUnlocked || !audioCtx) return;
+      if (generalSettings.completionSound !== true) return; // Muted by default per specification
+      try {
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+        const now = audioCtx.currentTime;
+        playTone(783.99, now, 0.1);
+        playTone(1046.50, now + 0.12, 0.18);
+      } catch (e) {}
+    }
+
+    // A plain gain increase plateaus fast: the OS/hardware media volume ceiling (Fire OS included)
+    // caps how loud a peak sample can physically get, no matter what a web page asks for, and cheap
+    // tablet speakers clip silently once you're near their max output anyway. So above 100% we stop
+    // relying on raw peak amplitude and instead make the tone perceptually louder the way mastered
+    // "loud" audio does: adding harmonic content via soft-clip distortion, then running everything
+    // through a compressor/limiter to raise the *average* energy (RMS loudness) without pushing the
+    // peak past what the hardware allows. This is genuinely louder-sounding at a fixed hardware
+    // ceiling, not just theoretically so.
+    let masterCompressor = null;
+    function getMasterChain() {
+      if (!masterCompressor || masterCompressor.context !== audioCtx) {
+        masterCompressor = audioCtx.createDynamicsCompressor();
+        const now = audioCtx.currentTime;
+        masterCompressor.threshold.setValueAtTime(-28, now);
+        masterCompressor.knee.setValueAtTime(6, now);
+        masterCompressor.ratio.setValueAtTime(16, now);
+        masterCompressor.attack.setValueAtTime(0.002, now);
+        masterCompressor.release.setValueAtTime(0.12, now);
+        masterCompressor.connect(audioCtx.destination);
+      }
+      return masterCompressor;
+    }
+
+    function makeDistortionCurve(amount) {
+      const samples = 256;
+      const curve = new Float32Array(samples);
+      for (let i = 0; i < samples; i++) {
+        const x = (i * 2) / samples - 1;
+        curve[i] = ((3 + amount) * x * 20 * Math.PI / 180) / (Math.PI + amount * Math.abs(x));
+      }
+      return curve;
+    }
+
+    function playTone(freq, time, duration, volumeOverride) {
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      const shaper = audioCtx.createWaveShaper();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, time);
+
+      let multiplier = (volumeOverride !== undefined) ? volumeOverride : (generalSettings.volume || MAX_VOLUME);
+      // 0 to 1.6x comes from raw amplitude (matches old behavior up through ~160%).
+      let peakGain = 0.15 * Math.min(multiplier, 1.6);
+      // Everything past that comes from drive (harmonics) + the compressor's makeup, which reads as
+      // louder without needing more headroom than the device already allows. Clamped so the top of the
+      // 1000% range stays a loud, harsh alarm rather than collapsing into pure static.
+      let drive = Math.max(0, multiplier - 1.6);
+      shaper.curve = makeDistortionCurve(Math.min(drive * 10, 60));
+      shaper.oversample = '4x';
+
+      gain.gain.setValueAtTime(peakGain, time);
+      gain.gain.exponentialRampToValueAtTime(0.0001, time + duration);
+
+      osc.connect(shaper);
+      shaper.connect(gain);
+      gain.connect(getMasterChain());
+      osc.start(time);
+      osc.stop(time + duration);
+    }
+
+    function generateTaskId() {
+      return 'task_' + Date.now() + '_' + Math.random().toString(36).slice(2, 10);
+    }
+
+    function sendCustomRequest() {
+      let anySelected = categories.some(cat => (selections[cat.key] || []).length > 0);
+      if (!anySelected) {
+        alert("Please select at least one option.");
+        return;
+      }
+
+      let roomCat = categories.find(c => c.key === 'room');
+      let roomTargets = roomCat ? (selections[roomCat.key] || []) : [];
+      let nonRoomCats = categories.filter(c => c.key !== 'room');
+
+      let personnelStr = "None";
+      let statusItems = [];
+      nonRoomCats.forEach((cat, i) => {
+        let sel = selections[cat.key] || [];
+        if (i === 0) {
+          if (sel.length > 0) personnelStr = sel.join(", ");
+        } else {
+          sel.forEach(item => statusItems.push(item));
+        }
+      });
+      // No fallback placeholder text here (it used to default to "Other") - if nothing in the status
+      // categories was picked, we simply store nothing, so the card description only ever shows what
+      // was actually selected.
+      let statusStr = statusItems.length > 0 ? statusItems.join(", ") : "";
+
+      // Every task created by this submission shares one timestamp, so they're recognized as the
+      // same "batch" (grouped together for sound evaluation) and so every device - including this
+      // one - waits for the same synchronized on-screen-timer moment before chiming.
+      let timestamp = new Date().toISOString();
+
+      let soundEntries = roomTargets.length > 0
+        ? roomTargets.map(r => ({ room: r, personnel: personnelStr, status: statusStr }))
+        : [{ room: '', personnel: personnelStr, status: statusStr }];
+
+      unlockAudio();
+      evaluateAndPlaySoundBatch(soundEntries);
+
+      if (roomTargets.length > 0) {
+        roomTargets.forEach(room => createTaskLocal(room, personnelStr, statusStr, timestamp));
+      } else {
+        let nonRoomSelectedItems = [];
+        nonRoomCats.forEach(cat => (selections[cat.key] || []).forEach(item => nonRoomSelectedItems.push(item)));
+        let cardTarget = nonRoomSelectedItems.length > 0 ? nonRoomSelectedItems[0] : "Alert";
+        createTaskLocal(cardTarget, personnelStr, statusStr, timestamp);
+      }
+
+      Object.keys(selections).forEach(k => { selections[k] = []; });
+      renderControlPanel();
+    }
+
+    function confirmClearTasks() {
+      if (!confirm('Mark ALL active requests as complete?')) return;
+      db.collection('tasks').get().then(function (snap) {
+        const docs = snap.docs;
+        const jobs = [];
+        for (let i = 0; i < docs.length; i += 400) {
+          const batch = db.batch();
+          docs.slice(i, i + 400).forEach(d => batch.delete(d.ref));
+          jobs.push(batch.commit());
+        }
+        return Promise.all(jobs);
+      }).catch(function (err) {
+        alert("Failed to complete all: " + err.message);
+      });
+    }
+
+    function getCardColor(personnel, status, room) {
+      if (room === MESSAGE_ROOM_KEY) return generalSettings.messageCardColor || '#cab0ed';
+      let persList = personnel.split(',').map(s => s.trim());
+      let statusList = status.split(',').map(s => s.trim());
+
+      if (statusList.includes("Help Front Desk") && persList.length > 0 && persList[0] !== "None") {
+        if (buttonStyles["Help Front Desk"] && buttonStyles["Help Front Desk"].card) {
+          return buttonStyles["Help Front Desk"].card;
+        }
+      }
+
+      let items = [...persList, ...statusList, room];
+      for (let item of items) {
+        if (buttonStyles[item] && buttonStyles[item].card) return buttonStyles[item].card;
+      }
+      return "#69c2c8";
+    }
+
+    // Builds the text shown in a card's details pill from ONLY what was actually selected at submit
+    // time. "None" (the internal placeholder used elsewhere in the app when no personnel was chosen),
+    // "Idle", and "Other" (the old status placeholder) are never real selections, so they're filtered
+    // out here rather than displayed.
+    function buildDetailsText(personnel, status) {
+      let persList = (personnel || '').split(',').map(s => s.trim()).filter(s => s && s !== 'None');
+      let statusList = (status || '').split(',').map(s => s.trim()).filter(s => s && s !== 'Idle' && s !== 'Other');
+      let parts = [];
+      if (persList.length) parts.push(persList.join(', '));
+      if (statusList.length) parts.push(statusList.join(', '));
+      return parts.length ? parts.join(' \u2022 ') : 'Request';
+    }
+
+    // The subset of generalSettings that lives in the spreadsheet's "Shared Settings" tab. Font size,
+    // master volume, mute, completion-sound, and theme stay device-local and are deliberately excluded.
+    function buildSharedPayload() {
+      return {
+        categories: categories.map(c => ({ key: c.key, title: c.title, items: c.items })),
+        styles: buttonStyles,
+        general: {
+          titleText: generalSettings.titleText,
+          fontFamily: generalSettings.fontFamily,
+          bg: generalSettings.bg,
+          sendBg: generalSettings.sendBg,
+          sendText: generalSettings.sendText,
+          msgBtnBg: generalSettings.msgBtnBg,
+          resetBtnBg: generalSettings.resetBtnBg,
+          settingsBtnBg: generalSettings.settingsBtnBg,
+          messageCardColor: generalSettings.messageCardColor,
+          messageSound: generalSettings.messageSound
+        }
+      };
+    }
+
+    // Applies settings read back from the spreadsheet to this device's live state + localStorage cache.
+    function applySharedSettings(data) {
+      if (!data) return;
+
+      if (Array.isArray(data.categories)) {
+        categories = data.categories.map(c => ({ key: c.key, title: c.title || '', items: Array.isArray(c.items) ? c.items : [] }));
+        localStorage.setItem('dental_categories', JSON.stringify(categories));
+
+        let newSelections = {};
+        categories.forEach(c => { newSelections[c.key] = selections[c.key] || []; });
+        selections = newSelections;
+
+        categories.forEach(c => {
+          if (!savedConfig[c.key]) {
+            savedConfig[c.key] = [...c.items];
+          } else {
+            c.items.forEach(item => { if (!savedConfig[c.key].includes(item)) savedConfig[c.key].push(item); });
+          }
+        });
+        localStorage.setItem('dental_sound_config', JSON.stringify(savedConfig));
+      }
+
+      if (data.styles && typeof data.styles === 'object') {
+        buttonStyles = data.styles;
+        localStorage.setItem('dental_btn_styles', JSON.stringify(buttonStyles));
+      }
+
+      if (data.general && typeof data.general === 'object') {
+        Object.keys(data.general).forEach(k => {
+          if (data.general[k] !== undefined) generalSettings[k] = data.general[k];
+        });
+        localStorage.setItem('dental_general_settings', JSON.stringify(generalSettings));
+      }
+
+      if (!isEditingMode) {
+        stagingCategories = JSON.parse(JSON.stringify(categories));
+        stagingButtonStyles = JSON.parse(JSON.stringify(buttonStyles));
+      }
+
+      applyGeneralSettings();
+      renderControlPanel();
+    }
+
+    // Pushes this device's current shared-eligible settings up to the spreadsheet. Last save wins.
+    // Pushes this device's current shared-eligible settings to everyone. Last save wins.
+    function syncSharedSettings() {
+      if (!db || (REQUIRE_LOGIN && !(auth && auth.currentUser))) return;
+      const json = JSON.stringify(buildSharedPayload());
+      lastAppliedSettingsJson = json;
+      db.collection('settings').doc('shared').set({
+        json: json,
+        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+      }).catch(function (err) {
+        console.error("Failed to sync shared settings:", err);
+      });
+    }
+
+    // ---------------- One-time import from the old Google Apps Script version ----------------
+    function openImportSettingsModal() {
+      document.getElementById('import-settings-textarea').value = '';
+      document.getElementById('import-error').style.display = 'none';
+      document.getElementById('import-settings-modal').style.display = 'flex';
+    }
+
+    function closeImportSettingsModal() {
+      document.getElementById('import-settings-modal').style.display = 'none';
+    }
+
+    function submitImportSettings() {
+      const errEl = document.getElementById('import-error');
+      errEl.style.display = 'none';
+      let data;
+      try {
+        data = JSON.parse(document.getElementById('import-settings-textarea').value.trim());
+      } catch (e) {
+        errEl.textContent = "That doesn't look like the exported settings text. Copy the whole thing and try again.";
+        errEl.style.display = 'block';
+        return;
+      }
+      if (!data || !Array.isArray(data.categories) || data.categories.length === 0) {
+        errEl.textContent = "No sections were found in that text.";
+        errEl.style.display = 'block';
+        return;
+      }
+      if (!confirm("Replace the shared sections, buttons, colors and sounds on every device with the imported ones?")) return;
+
+      applySharedSettings(data);
+      ensureDefaultStyles();
+      syncSharedSettings();
+      closeImportSettingsModal();
+    }
+
+    // ---------------- Live data (Firestore) ----------------
+    // tasks/{taskId}  -> { room, personnel, status, timestamp (ISO text), createdAt }
+    // settings/shared -> { json (all shared settings as one text value), updatedAt }
+    function startListeners() {
+      if (unsubTasks) return;
+      firstLoad = true;
+      knownTaskIds = new Set();
+
+      unsubTasks = db.collection('tasks').onSnapshot(
+        { includeMetadataChanges: true },
+        handleTasksSnapshot,
+        handleListenerError
+      );
+      unsubSettings = db.collection('settings').doc('shared').onSnapshot(
+        handleSettingsSnapshot,
+        handleListenerError
+      );
+    }
+
+    function stopListeners() {
+      if (unsubTasks) { unsubTasks(); unsubTasks = null; }
+      if (unsubSettings) { unsubSettings(); unsubSettings = null; }
+    }
+
+    function handleListenerError(err) {
+      console.error("Live connection error:", err);
+      if (err && (err.code === 'permission-denied' || err.code === 'unauthenticated')) {
+        if (REQUIRE_LOGIN) {
+          // The sign-in expired or the password was changed elsewhere: ask for the passcode again.
+          if (auth) auth.signOut().catch(function () {});
+        } else {
+          const b = document.getElementById('connection-banner');
+          b.textContent = 'The database refused access. Check that the rules were published (setup guide, step 5).';
+          b.style.display = 'block';
+        }
       }
     }
 
